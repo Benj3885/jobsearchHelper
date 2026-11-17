@@ -1,0 +1,11 @@
+# Example personal information (made up). Copy to data/personal.yaml and fill in your own.
+# data/personal.yaml is ignored by git; this file is used when it is missing and for the example PDFs.
+
+name: Jane Example Doe
+short_name: Jane Doe            # used in email signatures
+location: Exampleby, 0000
+phone: 12 34 56 78
+email: jane.doe@example.com
+github: ""                      # e.g. https://github.com/username – leave empty to omit
+linkedin: ""                    # e.g. https://www.linkedin.com/in/username – leave empty to omit
+file_prefix: ""                 # prefix of saved files; empty = first + last name, e.g. JANE_DOE

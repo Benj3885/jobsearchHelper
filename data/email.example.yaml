@@ -1,0 +1,30 @@
+# Example email text (made up). Same structure as data/email.yaml.
+# Used when data/email.yaml is missing (e.g. a fresh clone); copy it to data/email.yaml to start your own.
+# $name, $short_name, $phone, $email, $location are filled in from data/personal.yaml.
+
+da:
+  to: ''
+  subject: Softwareudvikler søger job – [firmanavn]
+  body: |
+    Hej [navn],
+
+    Jeg er softwareudvikler med erfaring i robotvision og søger job i området. Jeg skriver til jer, fordi I arbejder med [konkret ting], og det ligger tæt på det, jeg har lavet: Hos Nordlys Automation udviklede jeg et kamerabaseret kvalitetstjek af svejsede ståldele.
+
+    Har I brug for en som mig, nu eller senere? Et kort ja eller nej er helt fint. CV'et er vedhæftet.
+
+    Venlig hilsen
+    $short_name
+    $phone
+en:
+  to: ''
+  subject: Software developer looking for a job – [company]
+  body: |
+    Hi [name],
+
+    I'm a software developer with experience in robot vision, looking for work in the area. I'm writing because you work on [specific thing], which is close to what I've done: at Nordlys Automation I developed a camera-based quality check for welded steel parts.
+
+    Could you use someone like me, now or later? A short yes or no is fine. CV attached.
+
+    Best regards,
+    $short_name
+    $phone

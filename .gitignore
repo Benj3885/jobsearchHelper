@@ -1,0 +1,22 @@
+# ---- Personal information (template: data/personal.example.yaml)
+data/personal.yaml
+CLAUDE.local.md
+# Real CV content and default email/application text (made-up templates: data/*.example.yaml)
+data/cv.yaml
+data/application.yaml
+data/email.yaml
+data/*.bak
+
+# Material exported from claude.ai: CV, job search plan, contact details, employer notes
+docs/
+
+# Original CV and any other PDFs in the project root
+/*.pdf
+
+# ---- Generated files (contain the personal information above)
+output/
+build/
+
+# ---- Python
+__pycache__/
+*.pyc

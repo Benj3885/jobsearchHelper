@@ -1,0 +1,38 @@
+# Example application text (made up). Same structure as data/application.yaml.
+# Used with data/personal.example.yaml by make_examples.py, so the example PDFs contain no real information.
+
+da:
+  company: "Eksempel Robotics A/S"
+  recipient: "Anna Andersen"
+  subject: "Ansøgning: Softwareudvikler, robotvision"
+  closing: "Jeg håber at høre fra jer,"
+  body: |
+    Hej Anna,
+
+    Jeg har læst jeres opslag om en softwareudvikler til robotvision, og jeres arbejde med automatisk inspektion lyder som præcis den slags opgaver, jeg trives med.
+
+    De sidste tre år har jeg udviklet visionsoftware til kvalitetskontrol i industrien:
+
+    - **Vision i produktion.** Hos Nordlys Automation udviklede jeg et kamerabaseret tjek af svejsede ståldele, fra prototype til drift hos kunden.
+    - **Robotter.** Som forskningsassistent byggede jeg en punktsky-pipeline, der lod en robot gribe ukendte genstande.
+    - **Kvalitet.** Jeg satte automatiske tests og en CI-pipeline op, så nye versioner kunne udgives hurtigere og mere sikkert.
+
+    Jeg vil gerne fortælle mere ved en samtale.
+
+en:
+  company: "Example Robotics A/S"
+  recipient: "Anna Andersen"
+  subject: "Application: Software Developer, robot vision"
+  closing: "I hope to hear from you,"
+  body: |
+    Dear Anna,
+
+    I read your posting for a software developer in robot vision, and your work on automated inspection is exactly the kind of problem I enjoy.
+
+    For the last three years I have developed vision software for industrial quality control:
+
+    - **Vision in production.** At Nordlys Automation I developed a camera-based check of welded steel parts, from prototype to running at the customer.
+    - **Robots.** As a research assistant I built a point-cloud pipeline that let a robot grasp unknown objects.
+    - **Quality.** I set up automated tests and a CI pipeline, so new versions could be released faster and more safely.
+
+    I would be glad to tell you more in an interview.

@@ -1,0 +1,1031 @@
+"""Desktop editor for job search documents: email, job application and CV.
+
+Run with:  python cv_editor.py      (needs a Python with tkinter, e.g. the conda one)
+
+- Pick the document type and the language (Dansk/English) on the left.
+  Each type has its own boxes on the right.
+- Default text comes from data/cv.yaml, data/application.yaml and data/email.yaml.
+  Edits live in the window only; the YAML files are not changed.
+- "Compile" builds a temporary file (build/work/_preview_<type>/) and shows it in the middle.
+- "Save" copies it to output/: <name>_CV.pdf, <name>_APPLICATION.pdf or <name>_EMAIL.txt,
+  asking first if the file exists. PDFs carry the box contents as an attachment, so
+  "Import..." can fill the boxes again from a saved PDF (or from an email .txt).
+- "Save as default" writes the boxes back to the YAML file (backup in <file>.yaml.bak).
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+import shutil
+import subprocess
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
+
+import build_cv
+import documents
+import tabs
+
+ROOT = build_cv.ROOT
+OUTPUT = ROOT / "output"
+TEMPLATES = ["modern", "merged", "sidebar"]         # CV styles whose fields match the CV boxes
+
+# Box definitions per document type: (key, label, help text, height in lines; 1 = single-line entry)
+CV_FIELDS = [
+    ("name", "Name", "", 1),
+    ("headline", "Headline", "Shown under the name (modern template).", 1),
+    ("title", "Title", "Big title above the body (sidebar template).", 1),
+    ("location", "Location", "", 1),
+    ("phone", "Phone", "", 1),
+    ("email", "Email", "", 1),
+    ("skills", "Skills", "One per line. Group with 'Group: a, b, c'.", 8),
+    ("timeline", "Experiences", "One per line: 'period | text'. Oldest first. "
+                                "'- ' lines below an entry are its details (merged template).", 10),
+    ("body", "Body", "'## Heading' starts a section. Blank line between paragraphs.", 16),
+    ("languages", "Languages", "One per line.", 2),
+    ("references", "References", "One per line.", 2),
+]
+FIELDS = CV_FIELDS   # kept for older callers
+
+APPLICATION_FIELDS = [
+    ("company", "Company", "Name, phone, email and location are taken from the CV boxes.", 1),
+    ("recipient", "Recipient", "Contact person, shown as 'Att.' (Danish) or 'Attn.' (English). Leave empty to omit.", 1),
+    ("subject", "Subject", "", 1),
+    ("body", "Body", "Blank line between paragraphs. '- ' starts a bullet. **bold** for bold.", 22),
+    ("closing", "Closing", "Shown above your name.", 1),
+]
+
+EMAIL_FIELDS = [
+    ("to", "To", "Optional. Shown at the top of the .txt file.", 1),
+    ("subject", "Subject", "", 1),
+    ("body", "Body", "Plain text, saved exactly as written.", 24),
+]
+
+# Required fields: saving is blocked while they still contain a [placeholder].
+# Replacing the placeholder or emptying the field makes the document saveable. Compiling always works.
+REQUIRED = {
+    "email": {"subject", "body"},
+    "application": {"company", "recipient", "subject", "body"},
+    "cv": set(),
+}
+PLACEHOLDER = re.compile(r"\[[^\[\]\n]+\]")
+
+
+def placeholder_problems(form: dict[str, str], required: set[str]) -> list[str]:
+    """Keys of required fields that still contain a [placeholder]."""
+    return [key for key in form if key in required and PLACEHOLDER.search(form[key])]
+
+
+def render_pages(pdf: Path, outdir: Path, width: int) -> None:
+    """PDF -> outdir/page-<n>.png, scaled to `width` pixels."""
+    for old in outdir.glob("page-*.png"):
+        old.unlink()
+    subprocess.run(["pdftoppm", "-png", "-scale-to-x", str(width), "-scale-to-y", "-1",
+                    str(pdf), str(outdir / "page")], check=True)
+
+
+# key, button label, file suffix, extension, fields
+MODES = [
+    ("email", "Email", "_EMAIL", ".txt", EMAIL_FIELDS),
+    ("application", "Application", "_APPLICATION", ".pdf", APPLICATION_FIELDS),
+    ("cv", "CV", "_CV", ".pdf", CV_FIELDS),
+]
+DEFAULT_FILE_NAME = ""
+# Saved files: <PREFIX>_<name>_CV.pdf. The prefix comes from data/personal.yaml (e.g. JANE_DOE).
+
+
+def output_file_name(prefix: str, name: str, suffix: str, ext: str) -> str:
+    """('JANE_DOE', 'Trackunit') -> 'JANE_DOE_Trackunit_CV.pdf'. Prefix, suffix and extension are never doubled."""
+    name = re.sub(re.escape(ext) + "$", "", name.strip(), flags=re.IGNORECASE)
+    name = re.sub(re.escape(suffix) + "$", "", name, flags=re.IGNORECASE)
+    name = re.sub("^" + re.escape(prefix) + "_?", "", name, flags=re.IGNORECASE).strip("_ ")
+    return "_".join(part for part in (prefix, name) if part) + suffix + ext
+
+
+def name_from_company(company: str) -> str:
+    """'Trackunit A/S' -> 'Trackunit_AS' (usable in a file name). Empty if it is a [placeholder]."""
+    if PLACEHOLDER.search(company):
+        return ""
+    return re.sub(r"\s+", "_", re.sub(r"[/\\:*?\"<>|]", "", company.strip()))
+
+
+# --------------------------------------------------------------------------- cv.yaml <-> boxes
+
+def cv_to_form(cv: dict, track: str) -> dict[str, str]:
+    t = cv["tracks"][track]
+    side = cv.get("sidebar", {})
+    skills = []
+    for s in side.get("skills", []):
+        skills.append(f"{s['name']}: {', '.join(s['items'])}" if isinstance(s, dict) else s)
+    sections = t.get("main_sections", cv.get("main_sections", []))
+    body = "\n\n".join(
+        f"## {sec['heading']}\n\n" + "\n\n".join(" ".join(p.split()) for p in sec["paragraphs"])
+        for sec in sections
+    )
+    return {
+        "name": cv["name"],
+        "headline": t["headline"],
+        "title": t.get("cv_title", t["headline"]),
+        "location": cv["contact"].get("location", ""),
+        "phone": cv["contact"].get("phone", ""),
+        "email": cv["contact"].get("email", ""),
+        "skills": "\n".join(skills),
+        "timeline": "\n".join(
+            "\n".join([f"{x['period']} | {x['text']}"] + [f"- {' '.join(d.split())}" for d in x.get("details", [])])
+            for x in side.get("timeline", [])),
+        "body": body,
+        "languages": "\n".join(side.get("languages", [])),
+        "references": "\n".join(side.get("references", [])),
+    }
+
+
+def _lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def form_to_cv(base: dict, track: str, f: dict[str, str]) -> dict:
+    cv = copy.deepcopy(base)
+    cv["name"] = f["name"]
+    cv["contact"].update(location=f["location"], phone=f["phone"], email=f["email"])
+    t = cv["tracks"][track]
+    t["headline"] = f["headline"]
+    t["cv_title"] = f["title"]
+
+    skills = []
+    for line in _lines(f["skills"]):
+        if ":" in line:
+            name, items = line.split(":", 1)
+            skills.append({"name": name.strip(), "items": [i.strip() for i in items.split(",") if i.strip()]})
+        else:
+            skills.append(line)
+
+    timeline = []
+    for line in _lines(f["timeline"]):
+        if line.startswith("-"):                    # detail paragraph for the entry above
+            if not timeline:
+                timeline.append({"period": "", "text": ""})
+            timeline[-1].setdefault("details", []).append(line.lstrip("-").strip())
+            continue
+        period, _, text = line.partition("|")
+        timeline.append({"period": period.strip(), "text": text.strip()})
+
+    sections, current = [], None
+    for block in re.split(r"\n\s*\n", f["body"].strip()):
+        block = block.strip()
+        if not block:
+            continue
+        if block.startswith("##"):
+            heading, _, rest = block.partition("\n")
+            current = {"heading": heading.lstrip("#").strip(), "paragraphs": []}
+            sections.append(current)
+            block = rest.strip()
+            if not block:
+                continue
+        if current is None:
+            current = {"heading": "", "paragraphs": []}
+            sections.append(current)
+        current["paragraphs"].append(" ".join(block.split()))
+
+    cv["sidebar"] = {
+        **cv.get("sidebar", {}),                    # keeps keys without a box, e.g. merged_replaces
+        "skills": skills,
+        "timeline": timeline,
+        "languages": _lines(f["languages"]),
+        "references": _lines(f["references"]),
+    }
+    cv["main_sections"] = sections
+    t.pop("main_sections", None)
+    return cv
+
+
+# --------------------------------------------------------------------------- look & feel
+
+COLORS = {
+    "bg": "#EEF1F5",          # window background
+    "card": "#FFFFFF",        # panels
+    "border": "#D5DCE5",
+    "ink": "#1E2530",
+    "muted": "#6B7686",
+    "accent": "#1F5FA8",
+    "accent_hover": "#174C87",
+    "hover": "#F1F4F8",
+    "preview_bg": "#E3E7ED",
+    "page_shadow": "#C3CAD4",
+    "error": "#C62828",
+}
+# First installed family wins. Tk builds without Xft only see X11 core fonts.
+FONT_CANDIDATES = ["Inter", "Lato", "Ubuntu", "Noto Sans", "DejaVu Sans", "nimbus sans l", "helvetica"]
+
+
+def setup_style(root: tk.Tk) -> dict[str, tuple]:
+    import tkinter.font as tkfont
+
+    families = {f.lower(): f for f in tkfont.families(root)}
+    family = next((families[c.lower()] for c in FONT_CANDIDATES if c.lower() in families), "TkDefaultFont")
+    fonts = {
+        "body": (family, 10),
+        "small": (family, 9),
+        "bold": (family, 10, "bold"),
+        "title": (family, 13, "bold"),
+    }
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+        tkfont.nametofont(name).configure(family=family, size=10)
+
+    c = COLORS
+    root.configure(background=c["bg"])
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".", background=c["bg"], foreground=c["ink"], font=fonts["body"],
+                bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"],
+                troughcolor=c["bg"], focuscolor=c["accent"])
+    s.configure("TFrame", background=c["bg"])
+    s.configure("Card.TFrame", background=c["card"])
+    s.configure("TLabel", background=c["bg"], foreground=c["ink"])
+    s.configure("Card.TLabel", background=c["card"])
+    s.configure("Field.Card.TLabel", background=c["card"], font=fonts["bold"])
+    s.configure("Help.Card.TLabel", background=c["card"], foreground=c["muted"], font=fonts["small"])
+    s.configure("Title.Card.TLabel", background=c["card"], font=fonts["title"])
+    s.configure("Status.Card.TLabel", background=c["card"], foreground=c["muted"], font=fonts["small"])
+
+    # Buttons: filled accent for the main action, outlined for the rest.
+    s.configure("Accent.TButton", background=c["accent"], foreground="#FFFFFF", font=fonts["bold"],
+                borderwidth=0, padding=(18, 7), lightcolor=c["accent"], darkcolor=c["accent"])
+    s.map("Accent.TButton",
+          background=[("disabled", "#9DB3CF"), ("pressed", c["accent_hover"]), ("active", c["accent_hover"])],
+          lightcolor=[("active", c["accent_hover"])], darkcolor=[("active", c["accent_hover"])])
+    s.configure("TButton", background=c["card"], foreground=c["ink"], padding=(16, 6), borderwidth=1,
+                bordercolor=c["border"], lightcolor=c["card"], darkcolor=c["card"])
+    s.map("TButton",
+          background=[("disabled", c["card"]), ("pressed", c["hover"]), ("active", c["hover"])],
+          foreground=[("disabled", "#A9B2BE")],
+          bordercolor=[("active", c["accent"])])
+
+    s.configure("TEntry", fieldbackground="#FFFFFF", padding=(8, 5), insertcolor=c["ink"])
+    s.map("TEntry", bordercolor=[("focus", c["accent"])], lightcolor=[("focus", c["accent"])])
+    s.configure("TCombobox", fieldbackground="#FFFFFF", background=c["card"], padding=(8, 4), arrowcolor=c["muted"])
+    s.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")], bordercolor=[("focus", c["accent"])],
+          selectbackground=[("readonly", "#FFFFFF")], selectforeground=[("readonly", c["ink"])])
+    root.option_add("*TCombobox*Listbox.font", fonts["body"])
+    root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+
+    s.configure("Vertical.TScrollbar", background="#C9D0DA", troughcolor=c["card"], bordercolor=c["card"],
+                lightcolor="#C9D0DA", darkcolor="#C9D0DA", arrowsize=0, gripcount=0)
+    s.map("Vertical.TScrollbar", background=[("active", "#AEB7C4")])
+    s.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+        ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+    s.configure("TPanedwindow", background=c["bg"])
+    s.configure("Sash", sashthickness=10, gripcount=0, background=c["bg"], lightcolor=c["bg"], darkcolor=c["bg"])
+    # Segmented control (document type): outlined when off, filled when on.
+    s.configure("Segment.TButton", background=c["card"], foreground=c["muted"], font=fonts["bold"],
+                padding=(6, 7), borderwidth=1, bordercolor=c["border"], lightcolor=c["card"], darkcolor=c["card"])
+    s.map("Segment.TButton", background=[("active", c["hover"])], foreground=[("active", c["ink"])])
+    s.configure("SegmentOn.TButton", background=c["accent"], foreground="#FFFFFF", font=fonts["bold"],
+                padding=(6, 7), borderwidth=1, bordercolor=c["accent"], lightcolor=c["accent"], darkcolor=c["accent"])
+    s.map("SegmentOn.TButton", background=[("active", c["accent_hover"])])
+    # Top-level tabs (Documents / Job plan / Companies).
+    s.configure("TNotebook", background=c["bg"], borderwidth=0, bordercolor=c["border"],
+                lightcolor=c["bg"], darkcolor=c["bg"], tabmargins=(0, 0, 0, 0))
+    s.configure("TNotebook.Tab", background=c["bg"], foreground=c["muted"], font=fonts["bold"],
+                padding=(20, 8), borderwidth=0, bordercolor=c["border"], lightcolor=c["bg"])
+    s.map("TNotebook.Tab", background=[("selected", c["card"]), ("active", c["hover"])],
+          foreground=[("selected", c["accent"]), ("active", c["ink"])],
+          lightcolor=[("selected", c["accent"])], padding=[("selected", (20, 8))])
+    s.configure("Required.Card.TLabel", background=c["card"], foreground=c["error"], font=fonts["bold"])
+    s.configure("Error.Card.TLabel", background=c["card"], foreground=c["error"], font=fonts["small"])
+    s.configure("Invalid.TEntry", fieldbackground="#FFFFFF", padding=(8, 5), bordercolor=c["error"],
+                lightcolor=c["error"], darkcolor=c["error"])
+    s.configure("Blocked.TButton", background=c["card"], foreground=c["error"], padding=(16, 6), borderwidth=1,
+                bordercolor=c["error"], lightcolor=c["card"], darkcolor=c["card"])
+    s.map("Blocked.TButton", background=[("active", "#FDF1F1")])
+    return fonts
+
+
+# --------------------------------------------------------------------------- window
+#
+#   [ Documents | Job plan | Companies ]     tabs; Job plan and Companies are in tabs.py
+#
+#   Documents:
+#   ┌────────────────┬───────────────────────────────┬──────────────────────┐
+#   │ [Email|Appl|CV]│ File name  [Compile] [Save]   │ options for the type │
+#   │                │───────────────────────────────│ boxes for the type   │
+#   │ (more later)   │ preview (PDF pages or text)   │                      │
+#   └────────────────┴───────────────────────────────┴──────────────────────┘
+
+class ModeState:
+    """Everything that belongs to one document type."""
+
+    def __init__(self, key: str, label: str, suffix: str, ext: str, fields: list) -> None:
+        self.key, self.label, self.suffix, self.ext, self.fields = key, label, suffix, ext, fields
+        self.widgets: dict[str, tk.Widget] = {}
+        self.frame: ttk.Frame | None = None          # boxes on the right
+        self.file_name = tk.StringVar(value=DEFAULT_FILE_NAME)
+        self.status = "Edit the text and press Compile."
+        self.loaded_defaults: dict[str, str] = {}     # what the boxes were last filled with
+        self.required: set[str] = REQUIRED.get(key, set())
+        self.labels = {k: lbl for k, lbl, *_ in fields}
+        self.pending_form: dict[str, str] = {}        # form being compiled
+        self.compiled_form: dict[str, str] = {}       # form behind state.result (what Save stores)
+        self.result: Path | None = None              # last compiled temp file
+        self.images: list[tk.PhotoImage] = []        # PDF preview pages
+        self.rendered_width = 0                       # width the page images were rendered at
+        self.preview_dir = build_cv.WORK / f"_preview_{key}"
+        self.styles = (TEMPLATES if key == "cv" else
+                       list(documents.APPLICATION_TEMPLATES) if key == "application" else [])
+        self.style = tk.StringVar(value=self.styles[0] if self.styles else "")
+
+    @property
+    def is_pdf(self) -> bool:
+        return self.ext == ".pdf"
+
+
+def remove_previews() -> None:
+    """Delete the temporary preview folders (PDFs, page images and data with personal information)."""
+    for d in build_cv.WORK.glob("_preview_*"):
+        shutil.rmtree(d, ignore_errors=True)
+
+
+class Editor(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        remove_previews()          # left over if the editor crashed last time
+        self.title("Job search editor")
+        self.geometry("1560x920")
+        self.minsize(1150, 650)
+        self.fonts = setup_style(self)
+        self.personal = build_cv.load_personal()
+        self.file_prefix = build_cv.file_prefix(self.personal)
+        self.base_cv = build_cv.load_cv(self.personal)
+        self.modes = {m[0]: ModeState(*m) for m in MODES}
+        self.mode = self.modes["cv"]
+
+        self.language = "da"
+        self.track = tk.StringVar(value=next(iter(self.base_cv["tracks"])))
+        self.status = tk.StringVar()
+        self.suffix_label = tk.StringVar()
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(8, 10))
+        self.documents_tab = ttk.Frame(self.notebook, padding=(0, 10, 0, 0))
+        self.notebook.add(self.documents_tab, text="Documents")
+        self.plan_tab = tabs.PlanTab(self.notebook, COLORS, self.fonts)
+        self.notebook.add(self.plan_tab, text="Job plan")
+        self.companies_tab = tabs.CompaniesTab(self.notebook, COLORS, self.fonts,
+                                               on_application=self._start_application)
+        self.notebook.add(self.companies_tab, text="Companies", padding=(0, 10, 0, 0))
+        self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
+
+        panes = ttk.PanedWindow(self.documents_tab, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        panes.add(self._build_left(panes), weight=0)
+        panes.add(self._build_preview(panes), weight=3)
+        panes.add(self._build_right(panes), weight=2)
+        panes.bind("<Configure>", self._initial_columns)
+
+        self._load_cv_track()
+        self._fill_defaults(self.modes["application"])
+        self._fill_defaults(self.modes["email"])
+        self._switch_mode("cv")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _close(self) -> None:
+        if not self.plan_tab.confirm_close():
+            return
+        self.companies_tab._commit()       # notes typed but not yet saved
+        remove_previews()
+        self.destroy()
+
+    def _tab_changed(self, event) -> None:
+        """Reload the plan / company list if the file was changed outside the editor."""
+        tab = self.nametowidget(self.notebook.select())
+        if tab in (self.plan_tab, self.companies_tab):
+            tab.refresh()
+
+    def _start_application(self, company: str) -> None:
+        """From the Companies tab: open the application with the company filled in."""
+        self.notebook.select(self.documents_tab)
+        state = self.modes["application"]
+        if self.mode is not state:
+            self._switch_mode("application")
+        self._set(state, "company", company)
+        self.name_entry.delete(0, "end")
+        self.name_entry.insert(0, name_from_company(company))
+        self._mark_dirty(state)
+
+    def _initial_columns(self, event) -> None:
+        """Set column widths once, when the window has its real size: left 300px, boxes 540px."""
+        panes = event.widget
+        if event.width < 900:
+            return
+        panes.unbind("<Configure>")
+        panes.sashpos(1, event.width - 540)
+        panes.sashpos(0, 300)
+
+    @staticmethod
+    def _card(parent, **pack) -> ttk.Frame:
+        """White panel with a thin border."""
+        border = tk.Frame(parent, background=COLORS["border"])
+        border.pack(**pack)
+        inner = ttk.Frame(border, style="Card.TFrame")
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        return inner
+
+    # ---- left: document type
+    def _build_left(self, parent) -> ttk.Frame:
+        self.left_panel = ttk.Frame(parent)
+        card = self._card(self.left_panel, fill="x")
+        inner = ttk.Frame(card, style="Card.TFrame", padding=(12, 12))
+        inner.pack(fill="x")
+        ttk.Label(inner, text="Document", style="Help.Card.TLabel").pack(anchor="w", pady=(0, 6))
+        row = ttk.Frame(inner, style="Card.TFrame")
+        row.pack(fill="x")
+        self.mode_buttons: dict[str, ttk.Button] = {}
+        for i, (key, label, *_rest) in enumerate(MODES):
+            row.columnconfigure(i, weight=1, uniform="modes")
+            b = ttk.Button(row, text=label, style="Segment.TButton", command=lambda k=key: self._switch_mode(k))
+            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            self.mode_buttons[key] = b
+
+        ttk.Label(inner, text="Language", style="Help.Card.TLabel").pack(anchor="w", pady=(14, 6))
+        row = ttk.Frame(inner, style="Card.TFrame")
+        row.pack(fill="x")
+        self.lang_buttons: dict[str, ttk.Button] = {}
+        for i, (code, label) in enumerate(documents.LANGUAGES.items()):
+            row.columnconfigure(i, weight=1, uniform="langs")
+            b = ttk.Button(row, text=label, style="Segment.TButton", command=lambda c=code: self._switch_language(c))
+            b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            self.lang_buttons[code] = b
+        self.lang_note = ttk.Label(inner, text="", style="Help.Card.TLabel", wraplength=260, justify="left")
+        self.lang_note.pack(anchor="w", pady=(8, 0))
+        self._update_lang_buttons()
+        return self.left_panel
+
+    # ---- language
+    def _update_lang_buttons(self) -> None:
+        for code, b in self.lang_buttons.items():
+            b.configure(style="SegmentOn.TButton" if code == self.language else "Segment.TButton")
+        cv_mode = getattr(self, "mode", None) is not None and self.mode.key == "cv"
+        self.lang_note.configure(text="The CV text is in English only (data/cv.yaml)." if cv_mode else "")
+
+    def _switch_language(self, code: str) -> None:
+        if code == self.language:
+            return
+        self.language = code
+        self._update_lang_buttons()
+        # Swap the default text of email and application. Ask before replacing text the user edited.
+        states = [self.modes["email"], self.modes["application"]]
+        edited = [st for st in states if self._form(st) != st.loaded_defaults]
+        if edited:
+            names = " and ".join(st.label for st in edited)
+            if not messagebox.askyesno(
+                    "Change language",
+                    f"Replace the {names} text with the {documents.LANGUAGES[code]} default text?\n"
+                    "Your edits there will be lost. Choose No to keep the current text."):
+                states = [st for st in states if st not in edited]
+        for st in states:
+            self._fill_defaults(st)
+            self._mark_dirty(st)
+
+    # ---- middle: file name + buttons above the preview
+    def _build_preview(self, parent) -> ttk.Frame:
+        outer = ttk.Frame(parent)
+
+        bar = self._card(outer, fill="x", pady=(0, 10))
+        # Row 1: file name (the entry stretches with the column)
+        row = ttk.Frame(bar, style="Card.TFrame", padding=(14, 12, 14, 6))
+        row.pack(fill="x")
+        ttk.Label(row, text="File name", style="Field.Card.TLabel").pack(side="left")
+        ttk.Label(row, text=f"{self.file_prefix}_", style="Help.Card.TLabel").pack(side="left", padx=(10, 2))
+        self.name_entry = ttk.Entry(row, width=12)
+        self.name_entry.pack(side="left", fill="x", expand=True)
+        ttk.Label(row, textvariable=self.suffix_label, style="Help.Card.TLabel").pack(side="left", padx=(4, 0))
+        # Row 2: buttons + status, so the buttons stay visible however narrow the column is
+        buttons = ttk.Frame(bar, style="Card.TFrame", padding=(14, 0, 14, 4))
+        buttons.pack(fill="x")
+        self.compile_btn = ttk.Button(buttons, text="Compile", style="Accent.TButton", command=self._compile)
+        self.compile_btn.pack(side="left")
+        self.save_btn = ttk.Button(buttons, text="Save", command=self._save, state="disabled")
+        self.save_btn.pack(side="left", padx=(8, 0))
+        status = ttk.Label(bar, textvariable=self.status, style="Status.Card.TLabel", padding=(14, 2, 14, 2))
+        status.pack(fill="x")
+        # Row 3: why saving is blocked (empty when it isn't)
+        self.block_label = ttk.Label(bar, text="", style="Error.Card.TLabel", padding=(14, 0, 14, 10))
+        self.block_label.pack(fill="x")
+        bar.bind("<Configure>", lambda e: (status.configure(wraplength=max(200, e.width - 30)),
+                                           self.block_label.configure(wraplength=max(200, e.width - 30))))
+
+        self.preview_card = self._card(outer, fill="both", expand=True)
+        # PDF preview
+        self.pdf_view = ttk.Frame(self.preview_card, style="Card.TFrame")
+        self.preview = tk.Canvas(self.pdf_view, background=COLORS["preview_bg"], highlightthickness=0)
+        scroll = ttk.Scrollbar(self.pdf_view, orient="vertical", command=self.preview.yview)
+        self.preview.configure(yscrollcommand=scroll.set)
+        self.preview.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.preview.bind("<Configure>", self._on_preview_resize)
+        self._bind_wheel(self.preview)
+        # Text preview (email)
+        self.text_view = ttk.Frame(self.preview_card, style="Card.TFrame")
+        self.text_preview = tk.Text(self.text_view, wrap="word", font=self.fonts["body"], relief="flat",
+                                    borderwidth=0, padx=24, pady=20, background="#FFFFFF",
+                                    foreground=COLORS["ink"], highlightthickness=0, state="disabled")
+        tscroll = ttk.Scrollbar(self.text_view, orient="vertical", command=self.text_preview.yview)
+        self.text_preview.configure(yscrollcommand=tscroll.set)
+        self.text_preview.pack(side="left", fill="both", expand=True)
+        tscroll.pack(side="right", fill="y")
+        return outer
+
+    # ---- right: boxes for each document type
+    def _build_right(self, parent) -> ttk.Frame:
+        outer = ttk.Frame(parent)
+        self.right_card = self._card(outer, fill="both", expand=True)
+        for state in self.modes.values():
+            state.frame = self._build_mode_form(self.right_card, state)
+        return outer
+
+    def _build_mode_form(self, parent, state: ModeState) -> ttk.Frame:
+        frame = ttk.Frame(parent, style="Card.TFrame")
+
+        head = ttk.Frame(frame, style="Card.TFrame", padding=(16, 12, 16, 4))
+        head.pack(fill="x")
+        ttk.Label(head, text=state.label, style="Title.Card.TLabel").pack(side="left")
+        ttk.Button(head, text="Import...", command=lambda: self._import(state)).pack(side="right")
+
+        source = self._source_name(state)
+        actions = ttk.Frame(frame, style="Card.TFrame", padding=(16, 2, 16, 6))
+        actions.pack(fill="x")
+        ttk.Label(actions, text=f"Default text ({source}):", style="Help.Card.TLabel").pack(side="left")
+        ttk.Button(actions, text="Save as default", command=lambda: self._save_defaults(state)).pack(side="right")
+        ttk.Button(actions, text="Reload", command=lambda: self._reload(state)).pack(side="right", padx=(0, 6))
+
+        if state.styles:
+            opts = ttk.Frame(frame, style="Card.TFrame", padding=(16, 2, 16, 8))
+            opts.pack(fill="x")
+            ttk.Label(opts, text="Style", style="Help.Card.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Combobox(opts, textvariable=state.style, values=state.styles, state="readonly",
+                         width=12).grid(row=1, column=0, sticky="w")
+            if state.key == "cv":
+                ttk.Label(opts, text="Track", style="Help.Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+                track_box = ttk.Combobox(opts, textvariable=self.track, values=list(self.base_cv["tracks"]),
+                                         state="readonly", width=18)
+                track_box.grid(row=1, column=1, sticky="w", padx=(12, 0))
+                track_box.bind("<<ComboboxSelected>>", lambda e: self._load_cv_track())
+        tk.Frame(frame, height=1, background=COLORS["border"]).pack(fill="x")
+
+        body = ttk.Frame(frame, style="Card.TFrame")
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, highlightthickness=0, background=COLORS["card"])
+        scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        form = ttk.Frame(canvas, style="Card.TFrame", padding=(16, 4, 16, 16))
+        form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=form, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self._bind_wheel(canvas)
+
+        form.columnconfigure(0, weight=1)
+        row = 0
+        if state.required:
+            ttk.Label(form, text="* Required: replace or remove the [placeholders] before saving.",
+                      style="Error.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(10, 0))
+            row += 1
+        for key, label, help_text, height in state.fields:
+            label_row = ttk.Frame(form, style="Card.TFrame")
+            label_row.grid(row=row, column=0, sticky="w", pady=(12, 0))
+            ttk.Label(label_row, text=label, style="Field.Card.TLabel").pack(side="left")
+            if key in state.required:
+                ttk.Label(label_row, text=" *", style="Required.Card.TLabel").pack(side="left")
+            row += 1
+            if help_text:
+                ttk.Label(form, text=help_text, style="Help.Card.TLabel").grid(row=row, column=0, sticky="w")
+                row += 1
+            if height == 1:
+                w = ttk.Entry(form)
+                w.bind("<KeyRelease>", lambda e, s=state: self._mark_dirty(s))
+            else:
+                box, w = self._text_box(form, height, canvas)
+                w.bind("<<Modified>>", lambda e, s=state: self._on_text_modified(e, s))
+            (w if height == 1 else box).grid(row=row, column=0, sticky="ew", pady=(4, 0))
+            state.widgets[key] = w
+            row += 1
+        return frame
+
+    def _text_box(self, parent, height: int, form_canvas: tk.Canvas) -> tuple[tk.Frame, tk.Text]:
+        """A text box with its own scrollbar and a grip along the bottom edge to drag its height.
+
+        The mouse wheel scrolls the box while it can scroll that way, then the form (`form_canvas`)."""
+        box = tk.Frame(parent, background="#FFFFFF", highlightthickness=1,
+                       highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
+        box.columnconfigure(0, weight=1)
+        text = tk.Text(box, height=height, wrap="word", undo=True, font=self.fonts["body"],
+                       padx=8, pady=6, relief="flat", borderwidth=0, background="#FFFFFF",
+                       foreground=COLORS["ink"], insertbackground=COLORS["ink"],
+                       selectbackground=COLORS["accent"], selectforeground="#FFFFFF", highlightthickness=0)
+        scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        # Border on the frame, so it surrounds the scrollbar too: red while invalid (set by _validate),
+        # accent while focused, grey otherwise.
+        box.invalid = False
+
+        box.focused = False
+
+        def paint(focused: bool | None = None):
+            if focused is not None:
+                box.focused = focused
+            color = (COLORS["error"] if box.invalid else
+                     COLORS["accent"] if box.focused else COLORS["border"])
+            box.configure(highlightbackground=color, highlightcolor=color)
+        box.paint = paint
+        text.bind("<FocusIn>", lambda e: paint(True), add="+")
+        text.bind("<FocusOut>", lambda e: paint(False), add="+")
+
+        def wheel(e):
+            step = -1 if (e.num == 4 or e.delta > 0) else 1
+            top, bottom = text.yview()
+            if (step < 0 and top > 0) or (step > 0 and bottom < 1):
+                text.yview_scroll(step, "units")
+            else:
+                form_canvas.yview_scroll(step, "units")
+            return "break"                       # skip Tk's own text scrolling and the form's handler
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            text.bind(seq, wheel)
+
+        grip = tk.Frame(box, height=7, background=COLORS["border"], cursor="sb_v_double_arrow")
+        grip.grid(row=1, column=0, columnspan=2, sticky="ew")
+        line = tkfont.Font(font=self.fonts["body"]).metrics("linespace")
+
+        def drag(e):
+            pixels = e.y_root - text.winfo_rooty()
+            text.configure(height=max(2, round(pixels / line)))
+        grip.bind("<B1-Motion>", drag)
+        grip.bind("<Enter>", lambda e: grip.configure(background="#AEB7C4"))
+        grip.bind("<Leave>", lambda e: grip.configure(background=COLORS["border"]))
+        return box, text
+
+    def _bind_wheel(self, canvas: tk.Canvas) -> None:
+        def wheel(e):
+            canvas.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+        canvas.bind("<Enter>", lambda e: (canvas.bind_all("<MouseWheel>", wheel),
+                                          canvas.bind_all("<Button-4>", wheel),
+                                          canvas.bind_all("<Button-5>", wheel)))
+        canvas.bind("<Leave>", lambda e: (canvas.unbind_all("<MouseWheel>"),
+                                          canvas.unbind_all("<Button-4>"),
+                                          canvas.unbind_all("<Button-5>")))
+
+    # ---- switching document type
+    def _switch_mode(self, key: str) -> None:
+        old = self.mode
+        old.file_name.set(self.name_entry.get())
+        old.status = self.status.get()
+        if old.frame:
+            old.frame.pack_forget()
+
+        self.mode = state = self.modes[key]
+        state.frame.pack(fill="both", expand=True)
+        for k, b in self.mode_buttons.items():
+            b.configure(style="SegmentOn.TButton" if k == key else "Segment.TButton")
+        self._update_lang_buttons()
+        self.name_entry.delete(0, "end")
+        self.name_entry.insert(0, state.file_name.get())
+        self.suffix_label.set(f"{state.suffix}{state.ext}")
+        self.compile_btn.configure(text="Compile" if state.is_pdf else "Preview")
+        self.save_btn.configure(state="normal" if state.result else "disabled")
+        self._validate(state)
+        self.status.set(state.status)
+
+        self.pdf_view.pack_forget()
+        self.text_view.pack_forget()
+        if state.is_pdf:
+            self.pdf_view.pack(fill="both", expand=True)
+            self._show_pages()
+            self.after(50, self._rerender_preview)
+        else:
+            self.text_view.pack(fill="both", expand=True)
+            self._show_text(state.result.read_text(encoding="utf-8") if state.result else "")
+
+    # ---- form values
+    @staticmethod
+    def _get(state: ModeState, key: str) -> str:
+        w = state.widgets[key]
+        return w.get("1.0", "end-1c") if isinstance(w, tk.Text) else w.get()
+
+    @staticmethod
+    def _set(state: ModeState, key: str, value: str) -> None:
+        w = state.widgets[key]
+        if isinstance(w, tk.Text):
+            w.delete("1.0", "end")
+            w.insert("1.0", value)
+            w.edit_modified(False)
+        else:
+            w.delete(0, "end")
+            w.insert(0, value)
+
+    def _form(self, state: ModeState) -> dict[str, str]:
+        return {key: self._get(state, key) for key, *_ in state.fields}
+
+    def _fill_defaults(self, state: ModeState) -> None:
+        values = (cv_to_form(self.base_cv, self.track.get()) if state.key == "cv"
+                  else documents.load_defaults(state.key, self.language, self.personal))
+        for key, *_ in state.fields:
+            self._set(state, key, values.get(key, ""))
+        state.loaded_defaults = self._form(state)
+        self._validate(state)
+
+    def _load_cv_track(self) -> None:
+        state = self.modes["cv"]
+        values = cv_to_form(self.base_cv, self.track.get())
+        if any(self._get(state, k) for k, *_ in state.fields):
+            # Switching track only swaps the track-specific boxes; other edits are kept.
+            for key in ("headline", "title"):
+                self._set(state, key, values[key])
+        else:
+            self._fill_defaults(state)
+        self._mark_dirty(state)
+
+    def _source_name(self, state: ModeState) -> str:
+        return "cv.yaml" if state.key == "cv" else f"{state.key}.yaml"
+
+    def _reload(self, state: ModeState) -> None:
+        source = self._source_name(state)
+        if not messagebox.askyesno("Reload", f"Replace all {state.label} text with the content of {source}?"):
+            return
+        if state.key == "cv":
+            self.personal = build_cv.load_personal()
+            self.base_cv = build_cv.load_cv(self.personal)
+        self._fill_defaults(state)
+        self._mark_dirty(state)
+
+    def _save_defaults(self, state: ModeState) -> None:
+        """Overwrite the default text in the YAML file with what is in the boxes."""
+        path = documents.DATA / self._source_name(state)
+        if state.key == "cv":
+            what = (f"the CV text in {path.name} (track '{self.track.get()}' for headline and title) "
+                    "and your name and contact details in personal.yaml")
+        else:
+            what = f"the {documents.LANGUAGES[self.language]} {state.label.lower()} text in {path.name}"
+        if not messagebox.askyesno(
+                "Save as default",
+                f"Overwrite {what} with the text in the boxes?\n\n"
+                f"The previous file is kept as {path.name}.bak. Comments in the file are not kept."):
+            return
+        form = self._form(state)
+        if state.key == "cv":
+            self.base_cv = form_to_cv(self.base_cv, self.track.get(), form)
+            build_cv.save_cv(self.base_cv)          # name/contact -> personal.yaml, the rest -> cv.yaml
+            self.personal = build_cv.load_personal()
+        else:
+            documents.save_defaults(state.key, self.language, form)
+        state.loaded_defaults = form
+        self._set_status(state, f"Saved the boxes as default text in data/{path.name}")
+
+    def _import(self, state: ModeState) -> None:
+        """Fill the boxes from a PDF saved by the editor, or from an email .txt."""
+        path = filedialog.askopenfilename(
+            parent=self, title="Import file", initialdir=str(OUTPUT if OUTPUT.exists() else ROOT),
+            filetypes=[("Saved documents", "*.pdf *.txt"), ("PDF", "*.pdf"), ("Text", "*.txt")])
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() == ".txt":
+            fields, lang = documents.parse_email_txt(path.read_text(encoding="utf-8"))
+            data = {"type": "email", "lang": lang, "fields": fields}
+        else:
+            data = documents.read_embedded(path)
+            if data is None:
+                messagebox.showwarning(
+                    "Nothing to import",
+                    f"{path.name} has no editor data.\n\nOnly PDFs saved from this editor can be imported.")
+                return
+        target = self.modes.get(data.get("type", ""))
+        if target is None:
+            messagebox.showwarning("Nothing to import", f"Unknown document type in {path.name}.")
+            return
+        if not messagebox.askyesno("Import", f"Replace the {target.label} boxes with the text from {path.name}?"):
+            return
+
+        for key, *_ in target.fields:
+            if key in data["fields"]:
+                self._set(target, key, data["fields"][key])
+        if data.get("style") in target.styles:
+            target.style.set(data["style"])
+        if target.key == "cv" and data.get("track") in self.base_cv["tracks"]:
+            self.track.set(data["track"])
+        if data.get("lang") in documents.LANGUAGES and data["lang"] != self.language:
+            self.language = data["lang"]          # only the setting; other documents keep their text
+            self._update_lang_buttons()
+        name = re.sub(re.escape(target.suffix) + "$", "", path.stem, flags=re.IGNORECASE)
+        name = re.sub("^" + re.escape(self.file_prefix) + "_?", "", name, flags=re.IGNORECASE)
+        target.file_name.set(name)
+        if target is not self.mode:
+            self._switch_mode(target.key)
+        else:
+            self.name_entry.delete(0, "end")
+            self.name_entry.insert(0, name)
+        self._mark_dirty(target)
+        self._set_status(target, f"Imported {path.name}. Press Compile to see it.")
+
+    def _on_text_modified(self, event, state: ModeState) -> None:
+        if event.widget.edit_modified():
+            event.widget.edit_modified(False)
+            self._mark_dirty(state)
+
+    def _validate(self, state: ModeState) -> None:
+        """Red border on required fields with placeholders; update the save indicator."""
+        live = placeholder_problems(self._form(state), state.required)
+        for key, w in state.widgets.items():
+            bad = key in live
+            if isinstance(w, tk.Text):
+                w.master.invalid = bad          # the border is on the frame around the box (_text_box)
+                w.master.paint()
+            else:
+                w.configure(style="Invalid.TEntry" if bad else "TEntry")
+        if state is not self.mode:
+            return
+        compiled = placeholder_problems(state.compiled_form, state.required) if state.result else []
+        if live:
+            text = "Can't save: placeholders in " + ", ".join(state.labels[k] for k in live)
+        elif compiled:
+            text = "Can't save yet: compile again to use your changes"
+        else:
+            text = ""
+        self.block_label.configure(text=text)
+        self.save_btn.configure(style="Blocked.TButton" if text else "TButton")
+
+    def _mark_dirty(self, state: ModeState) -> None:
+        self._validate(state)
+        if state.result:
+            msg = "Text changed since last compile. Save stores the last compiled version."
+            state.status = msg
+            if state is self.mode:
+                self.status.set(msg)
+
+    # ---- compile
+    def _compile(self) -> None:
+        state = self.mode
+        state.preview_dir.mkdir(parents=True, exist_ok=True)
+
+        if not state.is_pdf:     # email: no LaTeX, just write the text file
+            out = state.preview_dir / "preview.txt"
+            text = documents.email_text(self._form(state), self.language)
+            out.write_text(text, encoding="utf-8")
+            state.result = out
+            state.compiled_form = self._form(state)
+            self._show_text(text)
+            self._set_status(state, "Preview ready. Not saved yet.")
+            self.save_btn.configure(state="normal")
+            self._validate(state)
+            return
+
+        form = self._form(state)
+        state.pending_form = form
+        cv_form = self._form(self.modes["cv"])
+        person = {k: cv_form[k].strip() for k in ("name", "location", "phone", "email")}
+        cv = form_to_cv(self.base_cv, self.track.get(), cv_form) if state.key == "cv" else None
+        style, track, lang = state.style.get(), self.track.get(), self.language
+        data = {"editor": 1, "type": state.key, "lang": lang, "style": style, "fields": form}
+        if state.key == "cv":
+            data["track"] = track
+        else:
+            data["person"] = person
+        embed = json.dumps(data, ensure_ascii=False, indent=1)
+        page_width = self._preview_page_width()   # fit pages to the preview panel
+        self.compile_btn.configure(state="disabled")
+        self._set_status(state, "Compiling...")
+
+        def work():
+            try:
+                if state.key == "cv":
+                    pdf = build_cv.build(cv, style, track, state.preview_dir, "preview", embed=embed)
+                else:
+                    pdf = documents.build_application(form, person, state.preview_dir, "preview", lang,
+                                                      style, embed)
+                render_pages(pdf, state.preview_dir, page_width)
+                state.rendered_width = page_width
+                self.after(0, self._compiled, state, pdf, None)
+            except Exception as e:  # BuildError, missing pdftoppm, …
+                self.after(0, self._compiled, state, None, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _compiled(self, state: ModeState, pdf: Path | None, error: str | None) -> None:
+        self.compile_btn.configure(state="normal")
+        if error:
+            self._set_status(state, "Compile failed.")
+            messagebox.showerror("Compile failed", error[-3000:])
+            return
+        state.result = pdf
+        state.compiled_form = state.pending_form
+        pages = self._load_pages(state)
+        self._set_status(state, f"Compiled ({len(pages)} page{'s' if len(pages) != 1 else ''}). Not saved yet.")
+        if state is self.mode:
+            self.save_btn.configure(state="normal")
+            self._show_pages()
+        self._validate(state)
+
+    def _load_pages(self, state: ModeState) -> list[Path]:
+        pages = sorted(state.preview_dir.glob("page-*.png"), key=lambda p: int(p.stem.split("-")[-1]))
+        state.images = [tk.PhotoImage(file=str(p)) for p in pages]
+        return pages
+
+    def _preview_page_width(self) -> int:
+        return max(300, self.preview.winfo_width() - 48)
+
+    def _on_preview_resize(self, _event=None) -> None:
+        """Redraw now; re-render the pages at the new width once the resizing has stopped."""
+        self._show_pages()
+        if getattr(self, "_resize_job", None):
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(250, self._rerender_preview)
+
+    def _rerender_preview(self) -> None:
+        self._resize_job = None
+        state = self.mode
+        width = self._preview_page_width()
+        if (not state.is_pdf or not state.result or not state.result.exists()
+                or abs(width - state.rendered_width) < 8 or self.compile_btn.instate(["disabled"])):
+            return
+        state.rendered_width = width
+        pdf = state.result
+
+        def work():
+            try:
+                render_pages(pdf, state.preview_dir, width)
+            except Exception:
+                return
+            self.after(0, self._rerendered, state, width)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _rerendered(self, state: ModeState, width: int) -> None:
+        if state.rendered_width != width:      # a newer resize or compile has taken over
+            return
+        self._load_pages(state)
+        if state is self.mode:
+            self._show_pages()
+
+    def _set_status(self, state: ModeState, msg: str) -> None:
+        state.status = msg
+        if state is self.mode:
+            self.status.set(msg)
+
+    def _show_pages(self) -> None:
+        c = self.preview
+        c.delete("all")
+        y, width = 20, c.winfo_width()
+        images = self.mode.images if self.mode.is_pdf else []
+        if not images:
+            c.create_text(width // 2, 60, text="Press Compile to see the PDF here.",
+                          fill=COLORS["muted"], font=self.fonts["body"])
+        for img in images:
+            x = max(20, (width - img.width()) // 2)
+            c.create_rectangle(x + 2, y + 3, x + img.width() + 2, y + img.height() + 3,
+                               fill=COLORS["page_shadow"], outline="")
+            c.create_image(x, y, image=img, anchor="nw")
+            y += img.height() + 20
+        c.configure(scrollregion=(0, 0, width, y))
+
+    def _show_text(self, text: str) -> None:
+        t = self.text_preview
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", text or "Press Preview to see the email text here.")
+        t.configure(state="disabled", foreground=COLORS["ink"] if text else COLORS["muted"])
+
+    # ---- save
+    def _save(self) -> None:
+        state = self.mode
+        if not state.result or not state.result.exists():
+            messagebox.showwarning("Nothing to save", "Compile first.")
+            return
+        problems = placeholder_problems(state.compiled_form, state.required)
+        if problems:
+            lines = "\n".join(f"  - {state.labels[k]}: {', '.join(PLACEHOLDER.findall(state.compiled_form[k])[:3])}"
+                              for k in problems)
+            live = placeholder_problems(self._form(state), state.required)
+            hint = ("Replace or remove them in the boxes, then compile again." if live else
+                    "The boxes are fixed, but the compiled version is older. Compile again, then save.")
+            messagebox.showerror("Can't save", f"These required fields still have placeholders:\n\n{lines}\n\n{hint}")
+            return
+        name = self.name_entry.get()
+        if not name.strip() and state.key == "application":
+            name = name_from_company(state.compiled_form.get("company", ""))   # empty name -> company
+        if re.search(r"[/\\:*?\"<>|]", name):
+            messagebox.showwarning("Invalid name", "Enter a file name without / \\ : * ? \" < > |")
+            return
+        dest = OUTPUT / output_file_name(self.file_prefix, name, state.suffix, state.ext)
+        if dest.exists() and not messagebox.askyesno("File exists", f"{dest.relative_to(ROOT)} already exists.\nReplace it?"):
+            return
+        OUTPUT.mkdir(exist_ok=True)
+        shutil.copyfile(state.result, dest)
+        self._set_status(state, f"Saved {dest.relative_to(ROOT)}")
+
+
+if __name__ == "__main__":
+    Editor().mainloop()

@@ -1,0 +1,148 @@
+# Example CV content (made up). Same structure as data/cv.yaml.
+# Used with data/personal.example.yaml by make_examples.py, so the example PDFs in templates/
+# contain no real information. Companies, projects and the paper are fictional.
+
+tracks:
+  robotics_vision:
+    headline: Robotics & Computer Vision Software Engineer
+    cv_title: CV - Robotics Engineer with Software Experience
+    skills_order: [languages, robotics, vision, tools, ways]
+    projects_first: true
+  software:
+    headline: Software Developer (C#, Python, C++)
+    cv_title: CV - Software Developer (C#, Python, C++)
+    skills_order: [languages, tools, vision, robotics, ways]
+    projects_first: false
+    languages_override: "C#, Python, C++, Rust"
+
+profile: >-
+  Engineer with a background in robotics and image analysis. I build software
+  for machines that see and move: calibration tools, inspection systems and
+  robot control. I like turning prototypes into tested, documented software
+  that other people can maintain.
+
+skills:
+  languages:
+    label: Languages
+    text: "Python, C++, C#, Rust"
+  robotics:
+    label: Robotics
+    text: "ROS 2, motion planning, collaborative robots, hand-eye calibration"
+  vision:
+    label: Computer vision & AI
+    text: "OpenCV, PyTorch, point clouds, dataset labelling and model evaluation"
+  tools:
+    label: Tools
+    text: "Git, Docker, CI pipelines, Linux"
+  ways:
+    label: Ways of working
+    text: "Agile teams, code review, writing clear documentation"
+
+experience:
+  - title: Vision Software Developer
+    org: Nordlys Automation ApS, Exampleby
+    period: 2022 – 2025
+    bullets:
+      - Developed a camera-based quality check for welded steel parts.
+      - Wrote calibration tools used by field technicians at customer sites.
+      - Set up automated tests and a CI pipeline for the vision software.
+  - title: Research Assistant, 3D perception
+    org: Example University
+    period: 2020 – 2022
+    bullets:
+      - Built a point-cloud pipeline for grasping unknown objects.
+      - Supervised student projects on robot vision.
+  - title: Student Developer
+    org: Fjordbyen Logistics A/S
+    period: 2018 – 2020
+    bullets:
+      - Maintained internal tools for warehouse scanning in C#.
+      - Wrote scripts that cut manual reporting time by half.
+
+projects:
+  - title: Open-source ROS 2 driver for a hobby robot arm
+    period: "2024"
+    tech: C++, ROS 2
+    bullets:
+      - Wrote a ROS 2 driver and simulation model for a low-cost 6-axis arm.
+      - Added examples and documentation so others could get started quickly.
+
+publication: >-
+  "Fast Grasp Detection in Cluttered Scenes", Example Conference on Robotics
+  2021. A lightweight method for finding grasp points from depth images.
+
+education:
+  - degree: M.Sc. in Robotics
+    org: Example University
+    period: 2018 – 2020
+  - degree: B.Sc. in Electronics
+    org: Example University
+    period: 2015 – 2018
+
+other:
+  - Danish (native), English (fluent), German (basic)
+  - Driver's licence
+  - "Free time: bouldering and building small robots"
+  - References available on request
+
+sidebar:
+  skills:
+    - name: Programming
+      items: [Python, C++, "C#", Rust]
+    - name: Robotics
+      items: [ROS 2, MoveIt]
+    - name: Vision
+      items: [OpenCV, PyTorch]
+    - Docker
+    - Git
+    - Driver's license
+  timeline:
+    - period: 2015 - 2018
+      text: B.Sc. in Electronics at Example University
+    - period: 2018 - 2020
+      text: M.Sc. in Robotics at Example University
+      details:
+        - >-
+          My thesis was about grasping unknown objects from depth images. It led
+          to a short paper on fast grasp detection.
+    - period: 2020 - 2022
+      text: Research Assistant in 3D perception at Example University
+      details:
+        - >-
+          I built a point-cloud pipeline for robot grasping and supervised student
+          projects on robot vision.
+    - period: 2022 - 2025
+      text: Vision Software Developer at Nordlys Automation ApS
+      details:
+        - >-
+          I developed a camera-based quality check for welded steel parts and wrote
+          calibration tools used by field technicians at customer sites.
+        - >-
+          I also set up automated tests and a CI pipeline, which made releases of
+          the vision software faster and safer.
+  languages:
+    - Danish (native)
+    - English (fluent)
+  references:
+    - Given on request
+  merged_replaces: [My experiences]
+
+main_sections:
+  - heading: My experiences
+    paragraphs:
+      - >-
+        At Nordlys Automation I developed a camera-based quality check for welded
+        steel parts and wrote calibration tools used by field technicians. I also
+        set up automated tests and a CI pipeline for the vision software.
+      - >-
+        Before that, I worked as a research assistant at Example University, where
+        I built a point-cloud pipeline for robot grasping and supervised student
+        projects.
+      - >-
+        My master's thesis was about grasping unknown objects from depth images,
+        and it led to a short paper on fast grasp detection.
+  - heading: Free-time
+    paragraphs:
+      - >-
+        In my free time I go bouldering and build small robots, most recently a
+        ROS 2 driver for a hobby robot arm.
