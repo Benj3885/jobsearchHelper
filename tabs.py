@@ -2,13 +2,15 @@
 
 Both read from docs/ (git-ignored, personal):
   docs/job-search-plan.md   shown formatted, editable as Markdown; reloaded when the file changes
-  docs/employers.csv        one row per company; Status, Last contact and Notes are edited here and
-                            saved straight back to the file
+  docs/employers.csv        one row per company (companies.CompanyList); every field is edited in the
+                            Companies tab and saved straight back to the file
+
+Also the job posting helpers used by the Companies tab and the quicklist: `ask_posting` (title + link
+dialog) and `PostingTextWindow` (the posting's text, pasted in and kept in output/<company>/<posting>/).
 """
 
 from __future__ import annotations
 
-import csv
 import datetime
 import os
 import re
@@ -16,17 +18,17 @@ import shutil
 import webbrowser
 from collections import Counter
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 import tkinter as tk
 
-DOCS = Path(__file__).resolve().parent / "docs"
-PLAN = DOCS / "job-search-plan.md"
-EMPLOYERS = DOCS / "employers.csv"
+import companies
+from companies import FITS, STATUSES
 
-# Steps of the process, in order. Values in the CSV that are not listed here are kept as they are.
-STATUSES = ["Not contacted", "Contacted", "Applied", "Interview", "Offer", "Rejected", "Not an option"]
-# A change to one of these sets "Last contact" to today.
-CONTACT_STATUSES = {"Contacted", "Applied", "Interview", "Offer", "Rejected"}
+DOCS = companies.DOCS
+PLAN = DOCS / "job-search-plan.md"
+
+GOOD = "#2E7D32"           # "posting text saved" (same green as a ready document)
+
 STATUS_COLORS = {
     "Contacted": "#1F5FA8",
     "Applied": "#6A3FA0",
@@ -35,7 +37,6 @@ STATUS_COLORS = {
     "Rejected": "#8A94A3",
     "Not an option": "#8A94A3",
 }
-REQUIRED_COLUMNS = ["Company", "Status", "Last contact", "Notes"]
 
 # Tk builds without Xft only have X11 core fonts, which cover Latin-1 (æøå are fine) but show
 # characters like • – “ as garbage. Text that is only displayed goes through `shown()`.
@@ -45,28 +46,6 @@ _LATIN1 = str.maketrans({"•": "·", "–": "-", "—": "-", "‒": "-", "“":
 
 def shown(text: str) -> str:
     return text.translate(_LATIN1)
-
-
-# --------------------------------------------------------------------------- employers.csv
-
-def load_companies(path: Path = EMPLOYERS) -> tuple[list[str], list[dict[str, str]]]:
-    """(column names, rows). Missing tracking columns are added (empty)."""
-    with path.open(newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        fields = list(reader.fieldnames or [])
-    fields += [c for c in REQUIRED_COLUMNS if c not in fields]
-    return fields, [{c: (r.get(c) or "") for c in fields} for r in rows]
-
-
-def save_companies(fields: list[str], rows: list[dict[str, str]], path: Path = EMPLOYERS) -> None:
-    """Write the CSV via a temporary file, so a crash never leaves half a file."""
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------- markdown -> Text
@@ -425,27 +404,231 @@ class StatusFilter:
             self.popup.destroy()
             self.popup = None
 
+# --------------------------------------------------------------------------- job postings
+
+def ask_posting(parent, model: companies.CompanyList, row: dict[str, str], title: str = "", url: str = "",
+                heading: str = "Add job posting") -> tuple[str, str] | None:
+    """Dialog for a posting's title and link. Returns (title, url), or None if cancelled.
+    `title` is the posting being edited ("" for a new one)."""
+    dlg = tk.Toplevel(parent)
+    dlg.title(heading)
+    dlg.transient(parent.winfo_toplevel())
+    dlg.resizable(True, False)
+    f = ttk.Frame(dlg, padding=16)
+    f.pack(fill="both", expand=True)
+    f.columnconfigure(1, weight=1)
+    ttk.Label(f, text=f"Company: {shown(row['Company'])}").grid(row=0, column=0, columnspan=2, sticky="w")
+    entries = []
+    for i, (label, value) in enumerate((("Title", title), ("Link", url)), start=1):
+        ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=(10, 0))
+        e = ttk.Entry(f, width=56)
+        e.insert(0, value)
+        e.grid(row=i, column=1, sticky="ew", padx=(10, 0), pady=(10, 0))
+        entries.append(e)
+    ttk.Label(f, text="The title names the folder output/<company>/<title>/. The link is optional.",
+              foreground="#6B7686").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    result: dict = {}
+
+    def ok(_event=None):
+        t, u = entries[0].get().strip(), entries[1].get().strip()
+        problem = model.posting_problem(row, t, ignore=title or None)
+        if problem is None and u and not u.startswith(("http://", "https://")):
+            problem = "The link must start with http:// or https://"
+        if problem:
+            messagebox.showwarning(heading, problem, parent=dlg)
+            return
+        result["value"] = (t, u)
+        dlg.destroy()
+
+    buttons = ttk.Frame(f)
+    buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(14, 0))
+    ttk.Button(buttons, text="OK", style="Accent.TButton", command=ok).pack(side="left")
+    ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side="left", padx=(6, 0))
+    dlg.bind("<Return>", ok)
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    dlg.wait_visibility()
+    dlg.grab_set()
+    entries[0].focus_set()
+    parent.wait_window(dlg)
+    return result.get("value")
+
+
+class PostingTextWindow(tk.Toplevel):
+    """The text of a job posting, pasted in so it can be read after the ad is taken down.
+    Saved as output/<company>/<posting>/job_posting.txt. One window per posting; `show` reuses it."""
+
+    open_windows: dict[tuple[str, str], "PostingTextWindow"] = {}
+
+    @classmethod
+    def show(cls, parent, model, colors, fonts, company: str, posting: str) -> "PostingTextWindow":
+        w = cls.open_windows.get((company, posting))
+        if w is not None and w.winfo_exists():
+            w.deiconify()
+            w.lift()
+            w.text.focus_set()
+            return w
+        return cls(parent, model, colors, fonts, company, posting)
+
+    @classmethod
+    def renamed(cls, old_company: str, new_company: str, old_posting: str | None = None,
+                new_posting: str | None = None) -> None:
+        """Keep open windows pointing at the right folder after a company or posting is renamed."""
+        for (c, t), w in list(cls.open_windows.items()):
+            if c == old_company and (old_posting is None or t == old_posting):
+                del cls.open_windows[(c, t)]
+                w.company, w.posting = new_company, (new_posting if old_posting is not None else t)
+                cls.open_windows[(w.company, w.posting)] = w
+                w._update_head()
+
+    @classmethod
+    def confirm_close_all(cls) -> bool:
+        """Before the editor closes: offer to save text that isn't saved. False = cancel closing."""
+        return all(w.close() for w in list(cls.open_windows.values()))
+
+    def __init__(self, parent, model: companies.CompanyList, colors, fonts, company: str, posting: str) -> None:
+        super().__init__(parent)
+        self.model, self.colors = model, colors
+        self.company, self.posting = company, posting
+        self.open_windows[(company, posting)] = self
+        self.geometry("780x860")
+        self.configure(background=colors["bg"])
+
+        head = ttk.Frame(self, style="Card.TFrame", padding=(16, 12))
+        head.pack(fill="x")
+        self.head_label = ttk.Label(head, style="Title.Card.TLabel")
+        self.head_label.pack(side="left")
+        self.link_btn = ttk.Button(head, text="Open link", padding=(8, 2), command=self._open_link)
+        self.link_btn.pack(side="right")
+        ttk.Label(self, text="Paste the job posting here and save it, so you can still read it after the ad "
+                             "is taken down.", foreground=colors["muted"], font=fonts["small"],
+                  padding=(16, 8, 16, 4)).pack(fill="x")
+
+        bottom = ttk.Frame(self, padding=(16, 8, 16, 12))
+        bottom.pack(side="bottom", fill="x")
+        ttk.Button(bottom, text="Save", style="Accent.TButton", command=self.save).pack(side="left")
+        ttk.Button(bottom, text="Close", command=self.close).pack(side="left", padx=(6, 0))
+        self.status = ttk.Label(bottom, foreground=colors["muted"])
+        self.status.pack(side="left", padx=(12, 0))
+
+        box = tk.Frame(self, background="#FFFFFF", highlightthickness=1, highlightbackground=colors["border"],
+                       highlightcolor=colors["border"])
+        box.pack(fill="both", expand=True, padx=16)
+        self.text = tk.Text(box, wrap="word", undo=True, font=fonts["body"], padx=12, pady=10, relief="flat",
+                            borderwidth=0, highlightthickness=0, background="#FFFFFF",
+                            foreground=colors["ink"], insertbackground=colors["ink"])
+        scroll = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.saved_text = companies.read_posting_text(company, posting)
+        self.text.insert("1.0", self.saved_text)
+        self.text.edit_reset()
+        self.text.bind("<<Paste>>", self._paste)
+        self.text.bind("<Control-s>", lambda e: (self.save(), "break")[1])
+        self.text.bind("<<Modified>>", lambda e: self._update_status())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self._update_head()
+        self._update_status()
+        self.text.focus_set()
+
+    def _row_posting(self) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+        row = self.model.find(self.company)
+        posting = next((p for p in self.model.postings(row) if p["title"] == self.posting), None)
+        return row, posting
+
+    def _update_head(self) -> None:
+        self.title(f"Job posting - {shown(self.posting)} - {shown(self.company)}")
+        self.head_label.configure(text=f"{shown(self.posting)}   ·   {shown(self.company)}")
+        _, posting = self._row_posting()
+        self.link_btn.configure(state="normal" if posting and posting["url"] else "disabled")
+
+    def _update_status(self) -> None:
+        self.text.edit_modified(False)
+        if self.modified():
+            self.status.configure(text="Not saved", foreground=self.colors["error"])
+        elif self.saved_text:
+            self.status.configure(text=f"Saved in output/{companies.folder_name(self.company)}/"
+                                       f"{companies.folder_name(self.posting)}/{companies.POSTING_TEXT}",
+                                  foreground=self.colors["muted"])
+        else:
+            self.status.configure(text="No text saved yet", foreground=self.colors["muted"])
+
+    def _paste(self, _event) -> str:
+        """Paste with characters this Tk can't draw (• – “ ...) turned into plain lookalikes."""
+        try:
+            clip = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        try:
+            self.text.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        self.text.insert("insert", shown(clip))
+        self.text.see("insert")
+        return "break"
+
+    def _open_link(self) -> None:
+        _, posting = self._row_posting()
+        if posting and posting["url"]:
+            webbrowser.open(posting["url"])
+
+    def modified(self) -> bool:
+        return self.text.get("1.0", "end-1c") != self.saved_text
+
+    def save(self) -> bool:
+        row, posting = self._row_posting()
+        if posting is None:
+            messagebox.showerror("Save posting text", f"'{self.posting}' is no longer a posting of "
+                                                      f"{self.company} in the company list.", parent=self)
+            return False
+        text = self.text.get("1.0", "end-1c")
+        try:
+            companies.write_posting_text(self.company, self.posting, text)
+        except OSError as e:
+            messagebox.showerror("Save posting text", f"Could not save:\n{e}", parent=self)
+            return False
+        self.saved_text = text
+        self._update_status()
+        self.status.configure(text=self.status.cget("text") + f"  ({datetime.datetime.now():%H:%M})")
+        self.model.documents_changed()
+        return True
+
+    def close(self) -> bool:
+        if self.modified():
+            self.lift()
+            answer = messagebox.askyesnocancel("Unsaved posting text",
+                                               f"Save the text of '{self.posting}' before closing?", parent=self)
+            if answer is None or (answer and not self.save()):
+                return False
+        self.open_windows.pop((self.company, self.posting), None)
+        self.destroy()
+        return True
+
 
 class CompaniesTab(ttk.Frame):
-    """Table of docs/employers.csv with a detail panel. Status, Last contact and Notes are saved to
-    the file as soon as they change. `on_application(company)` starts an application to that company."""
+    """Table of docs/employers.csv with a detail panel where every field is edited. Changes are saved
+    to the file as soon as a field is left. 'Interesting' puts a company on the Documents tab's
+    quicklist. `on_open(company, posting)` makes it the company (and job posting, or None) being worked
+    on in the Documents tab."""
 
-    COLUMNS = [("Company", 220), ("Fit", 70), ("Track", 120), ("Town", 150), ("Status", 110),
-               ("Last contact", 100)]
+    COLUMNS = [("Company", 220), ("Fit", 70), ("Track", 120), ("Town", 130), ("Status", 110),
+               ("Last contact", 100), ("Quicklist", 80)]
     SORT_KEYS = {
         "Fit": lambda v: {"High": 0, "Medium": 1, "Low": 2}.get(v, 3),
         "Status": lambda v: STATUSES.index(v) if v in STATUSES else len(STATUSES),
     }
+    # Single-line fields in the detail panel, in order.
+    FIELDS = ["Fit", "Track", "Town", "What they do", "Contact person", "Email", "Homepage", "Source"]
+    LINK_FIELDS = ("Homepage", "Source")     # get an "Open" button
 
-    def __init__(self, parent, colors, fonts, on_application=None, path: Path = EMPLOYERS) -> None:
+    def __init__(self, parent, colors, fonts, model: companies.CompanyList, on_open=None) -> None:
         super().__init__(parent)
-        self.colors, self.fonts, self.path = colors, fonts, path
-        self.on_application = on_application
-        self.fields: list[str] = []
-        self.rows: list[dict[str, str]] = []
-        self.current: int | None = None          # index of the company shown in the detail panel
+        self.colors, self.fonts, self.model = colors, fonts, model
+        self.on_open = on_open
+        self.current: int | None = None          # index (into model.rows) of the company in the panel
         self.sort_column, self.sort_reverse = None, False
-        self.mtime = None
+        model.listeners.append(self._on_model)
+        model.doc_listeners.append(lambda: self._fill_postings())
 
         self._style()
         top = ttk.Frame(self, padding=(0, 0, 0, 10))
@@ -458,12 +641,20 @@ class CompaniesTab(ttk.Frame):
         self.status_filter.button.pack(side="left", padx=(0, 16))
         self.summary = ttk.Label(top, foreground=colors["muted"])
         self.summary.pack(side="left")
+        ttk.Button(top, text="Add company...", style="Accent.TButton", command=self._add).pack(side="right")
 
+        ttk.Label(self, text="In the table: click Quicklist to tick it, click Status or Fit to change them, "
+                             "double-click Track / Town / Last contact to edit, double-click Company to rename.",
+                  foreground=colors["muted"], font=fonts["small"]).pack(side="bottom", anchor="w", pady=(6, 0))
         panes = ttk.PanedWindow(self, orient="horizontal")
         panes.pack(fill="both", expand=True)
         panes.add(self._build_table(panes), weight=3)
         panes.add(self._build_details(panes), weight=2)
-        self.refresh(force=True)
+        self._fill_tree()
+
+    @property
+    def rows(self) -> list[dict[str, str]]:
+        return self.model.rows
 
     def _style(self) -> None:
         s = ttk.Style(self)
@@ -474,6 +665,8 @@ class CompaniesTab(ttk.Frame):
         s.configure("Treeview.Heading", background=c["hover"], foreground=c["ink"], font=self.fonts["bold"],
                     borderwidth=0, relief="flat", padding=(6, 5))
         s.map("Treeview.Heading", background=[("active", c["border"])])
+        s.configure("Card.TCheckbutton", background=c["card"])
+        s.map("Card.TCheckbutton", background=[("active", c["card"])])
 
     # ---- left: table
     def _build_table(self, parent) -> tk.Frame:
@@ -487,11 +680,16 @@ class CompaniesTab(ttk.Frame):
             self.tree.column(col, width=width, minwidth=50, anchor="w", stretch=col in ("Company", "Track"))
         for status, color in STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
+        self.tree.tag_configure("interesting", font=self.fonts["bold"])
         scroll = ttk.Scrollbar(inner, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+        self.tree.bind("<Button-1>", self._cell_click)
+        self.tree.bind("<Double-1>", self._cell_double)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.tree.bind(seq, lambda e: self._end_cell_edit(), add="+")
         return border
 
     # ---- right: details of the selected company
@@ -500,41 +698,96 @@ class CompaniesTab(ttk.Frame):
         d = ttk.Frame(border, style="Card.TFrame", padding=(16, 14))
         d.pack(fill="both", expand=True, padx=1, pady=1)
         d.columnconfigure(1, weight=1)
-        self.d_title = ttk.Label(d, text="Choose a company", style="Title.Card.TLabel")
-        self.d_title.grid(row=0, column=0, columnspan=3, sticky="w")
-        self.d_info = ttk.Label(d, style="Help.Card.TLabel", justify="left")
-        self.d_info.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        self.d_what = ttk.Label(d, style="Card.TLabel", justify="left", wraplength=380)
-        self.d_what.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        self.d_source = tk.Label(d, background=self.colors["card"], foreground=self.colors["accent"],
-                                 cursor="hand2", font=self.fonts["small"] + ("underline",),
-                                 anchor="w", justify="left", wraplength=380)
-        self.d_source.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        self.d_source.bind("<Button-1>", lambda e: self._open_source())
-        d.bind("<Configure>", lambda e: (self.d_what.configure(wraplength=e.width - 40),
-                                         self.d_source.configure(wraplength=e.width - 40)))
+        head = ttk.Frame(d, style="Card.TFrame")
+        head.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.d_title = ttk.Label(head, text="Choose a company", style="Title.Card.TLabel")
+        self.d_title.pack(side="left")
+        self.rename_btn = ttk.Button(head, text="Rename...", padding=(8, 2), command=self._rename)
+        self.rename_btn.pack(side="right")
 
-        ttk.Label(d, text="Status", style="Field.Card.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 0))
+        self.d_interesting = tk.BooleanVar()
+        self.interest_box = ttk.Checkbutton(d, text="Interesting: put it on the quicklist in the Documents tab",
+                                            variable=self.d_interesting, style="Card.TCheckbutton",
+                                            command=self._interest_changed)
+        self.interest_box.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 4))
+
+        self.entries: dict[str, ttk.Entry] = {}
+        row = 2
+        for field in self.FIELDS:
+            ttk.Label(d, text=field, style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
+            if field == "Fit":
+                w = ttk.Combobox(d, values=FITS, width=12)
+                w.bind("<<ComboboxSelected>>", lambda e: self._commit())
+                w.grid(row=row, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
+            else:
+                w = ttk.Entry(d)
+                w.grid(row=row, column=1, sticky="ew", pady=(6, 0), padx=(12, 0))
+            w.bind("<FocusOut>", lambda e: self._commit())
+            w.bind("<Return>", lambda e: self._commit())
+            self.entries[field] = w
+            if field in self.LINK_FIELDS:
+                ttk.Button(d, text="Open", padding=(8, 2), command=lambda f=field: self._open_link(f)).grid(
+                    row=row, column=2, sticky="w", pady=(6, 0), padx=(6, 0))
+            row += 1
+
+        ttk.Label(d, text="Status", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(14, 0))
         self.d_status = tk.StringVar()
         self.status_box = ttk.Combobox(d, textvariable=self.d_status, state="readonly", values=STATUSES, width=18)
-        self.status_box.grid(row=4, column=1, sticky="w", pady=(18, 0), padx=(12, 0))
+        self.status_box.grid(row=row, column=1, sticky="w", pady=(14, 0), padx=(12, 0))
         self.status_box.bind("<<ComboboxSelected>>", lambda e: self._status_changed())
+        row += 1
 
-        ttk.Label(d, text="Last contact", style="Field.Card.TLabel").grid(row=5, column=0, sticky="w", pady=(8, 0))
-        row = ttk.Frame(d, style="Card.TFrame")
-        row.grid(row=5, column=1, sticky="w", pady=(8, 0), padx=(12, 0))
-        self.d_date = ttk.Entry(row, width=14)
+        ttk.Label(d, text="Last contact", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        date_row = ttk.Frame(d, style="Card.TFrame")
+        date_row.grid(row=row, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
+        self.d_date = ttk.Entry(date_row, width=14)
         self.d_date.pack(side="left")
         self.d_date.bind("<FocusOut>", lambda e: self._commit())
         self.d_date.bind("<Return>", lambda e: self._commit())
-        ttk.Button(row, text="Today", command=self._today).pack(side="left", padx=(6, 0))
+        self.today_btn = ttk.Button(date_row, text="Today", command=self._today)
+        self.today_btn.pack(side="left", padx=(6, 0))
+        row += 1
 
-        ttk.Label(d, text="Notes", style="Field.Card.TLabel").grid(row=6, column=0, sticky="nw", pady=(14, 0))
+        # Job postings: title, whether the posting text is saved, link
+        ttk.Label(d, text="Job postings", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w",
+                                                                         pady=(14, 0))
+        pbar = ttk.Frame(d, style="Card.TFrame")
+        pbar.grid(row=row, column=1, columnspan=2, sticky="e", pady=(14, 0))
+        self.posting_btns = {}
+        for key, text, command in (("add", "Add...", self._add_posting), ("edit", "Edit...", self._edit_posting),
+                                   ("remove", "Remove", self._remove_posting),
+                                   ("text", "Posting text", self._posting_text)):
+            b = ttk.Button(pbar, text=text, padding=(8, 2), command=command)
+            b.pack(side="left", padx=(4, 0))
+            self.posting_btns[key] = b
+        row += 1
+        pborder = tk.Frame(d, background=self.colors["border"])
+        pborder.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self.p_tree = ttk.Treeview(pborder, columns=("title", "text", "link"), show="headings", height=3,
+                                   selectmode="browse")
+        for col, text, width, stretch in (("title", "Posting", 220, True), ("text", "Posting text", 110, False),
+                                          ("link", "Link", 60, False)):
+            self.p_tree.heading(col, text=text, anchor="w")
+            self.p_tree.column(col, width=width, minwidth=40, anchor="w", stretch=stretch)
+        self.p_tree.tag_configure("saved", foreground=GOOD)
+        self.p_tree.tag_configure("missing", foreground=self.colors["muted"])
+        self.p_tree.pack(fill="both", expand=True, padx=1, pady=1)
+        self.p_tree.bind("<<TreeviewSelect>>", lambda e: self._posting_buttons())
+        self.p_tree.bind("<Double-1>", lambda e: self.p_tree.identify_row(e.y) and self._posting_text())
+        self.p_tree.bind("<Button-1>", self._posting_click)
+        row += 1
+        ttk.Label(d, text="Double-click a posting to read or paste the ad's text.", style="Help.Card.TLabel"
+                  ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        row += 1
+
+        ttk.Label(d, text="Notes", style="Field.Card.TLabel").grid(row=row, column=0, sticky="nw", pady=(14, 0))
+        row += 1
         box = tk.Frame(d, background="#FFFFFF", highlightthickness=1,
                        highlightbackground=self.colors["border"], highlightcolor=self.colors["border"])
-        box.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        d.rowconfigure(7, weight=1)
-        self.d_notes = tk.Text(box, wrap="word", undo=True, font=self.fonts["body"], height=8, padx=8, pady=6,
+        box.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
+        d.rowconfigure(row, weight=1)
+        row += 1
+        self.d_notes = tk.Text(box, wrap="word", undo=True, font=self.fonts["body"], height=6, padx=8, pady=6,
                                relief="flat", borderwidth=0, highlightthickness=0, background="#FFFFFF",
                                foreground=self.colors["ink"], insertbackground=self.colors["ink"])
         nscroll = ttk.Scrollbar(box, orient="vertical", command=self.d_notes.yview)
@@ -546,10 +799,12 @@ class CompaniesTab(ttk.Frame):
                                                    self._commit()))
 
         bottom = ttk.Frame(d, style="Card.TFrame")
-        bottom.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        self.app_btn = ttk.Button(bottom, text="Write application", style="Accent.TButton",
-                                  command=self._write_application)
-        self.app_btn.pack(side="left")
+        bottom.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.open_btn = ttk.Button(bottom, text="Work on it in Documents", style="Accent.TButton",
+                                   command=self._open)
+        self.open_btn.pack(side="left")
+        self.delete_btn = ttk.Button(bottom, text="Delete", command=self._delete)
+        self.delete_btn.pack(side="left", padx=(6, 0))
         self.saved = ttk.Label(bottom, style="Status.Card.TLabel")
         self.saved.pack(side="right")
         self._show_details(None)
@@ -558,60 +813,173 @@ class CompaniesTab(ttk.Frame):
     # ---- data
     def refresh(self, force: bool = False) -> None:
         """(Re)load the CSV if it changed on disk, e.g. edited in another program."""
-        if not self.path.exists():
-            self.fields, self.rows, self.mtime = [], [], None
-            self.summary.configure(text=f"docs/{self.path.name} not found")
-            self._fill_tree()
+        self.model.refresh(force)
+        if not self.model.path.exists():
+            self.summary.configure(text=f"docs/{self.model.path.name} not found: 'Add company...' creates it")
+
+    def _on_model(self, source) -> None:
+        """The list changed elsewhere (quicklist, file on disk): show the new state."""
+        if source is self:
             return
-        mtime = self.path.stat().st_mtime
-        if not force and mtime == self.mtime:
-            return
-        self._commit(save=False)
-        name = self.rows[self.current]["Company"] if self.current is not None else None
-        self.fields, self.rows = load_companies(self.path)
-        self.mtime = mtime
-        self.current = next((i for i, r in enumerate(self.rows) if r["Company"] == name), None)
+        name = self.rows[self.current]["Company"] if self.current is not None and self.current < len(self.rows) \
+            else None
+        self.current = None
+        if name is not None:
+            row = self.model.find(name)
+            self.current = self.rows.index(row) if row is not None else None
         self._fill_tree()
+        self._show_details(self.current)
 
     def _save(self) -> None:
-        try:
-            save_companies(self.fields, self.rows, self.path)
-            self.mtime = self.path.stat().st_mtime
-            self.saved.configure(text=f"Saved {datetime.datetime.now():%H:%M}",
-                                 foreground=self.colors["muted"])
-        except OSError as e:
-            self.saved.configure(text=f"Could not save: {e}", foreground=self.colors["error"])
+        error = self.model.save(source=self)
+        if error:
+            self.saved.configure(text=f"Could not save: {error}", foreground=self.colors["error"])
+        else:
+            self.saved.configure(text=f"Saved {datetime.datetime.now():%H:%M}", foreground=self.colors["muted"])
+
+    def _values(self, r: dict[str, str]) -> list[str]:
+        values = []
+        for c, _ in self.COLUMNS:
+            if c == "Quicklist":
+                values.append("[x]" if companies.is_interesting(r) else "[  ]")
+            else:
+                values.append(shown(r.get(c, "")))
+        return values
+
+    def _tags(self, r: dict[str, str]) -> tuple[str, ...]:
+        return (r["Status"],) + (("interesting",) if companies.on_quicklist(r) else ())
 
     def _visible(self, r: dict[str, str]) -> bool:
         if r["Status"] in self.status_filter.hidden:
             return False
         q = self.search.get().strip().lower()
-        return not q or any(q in (r.get(c) or "").lower() for c in ("Company", "Town", "Track", "What they do", "Notes"))
+        return not q or any(q in (r.get(c) or "").lower()
+                            for c in ("Company", "Town", "Track", "What they do", "Notes", "Contact person", "Job postings"))
 
     def _fill_tree(self) -> None:
+        self._end_cell_edit()
         self.tree.delete(*self.tree.get_children())
         self.status_filter.counts = Counter(r["Status"] for r in self.rows)
         self.status_filter._update_label()
         order = list(range(len(self.rows)))
         if self.sort_column:
             key = self.SORT_KEYS.get(self.sort_column, str.lower)
-            order.sort(key=lambda i: key(self.rows[i][self.sort_column]), reverse=self.sort_reverse)
+            values = {i: self._values(self.rows[i])[[c for c, _ in self.COLUMNS].index(self.sort_column)]
+                      for i in order}
+            order.sort(key=lambda i: key(values[i]), reverse=self.sort_reverse)
         for i in order:
             r = self.rows[i]
             if self._visible(r):
-                self.tree.insert("", "end", iid=str(i), values=[shown(r.get(c, "")) for c, _ in self.COLUMNS],
-                                 tags=(r["Status"],))
+                self.tree.insert("", "end", iid=str(i), values=self._values(r), tags=self._tags(r))
         if self.current is not None and self.tree.exists(str(self.current)):
             self.tree.selection_set(str(self.current))
             self.tree.see(str(self.current))
         self._update_summary()
 
+    def _update_row(self, index: int | None = None) -> None:
+        index = self.current if index is None else index
+        if index is not None and self.tree.exists(str(index)):
+            r = self.rows[index]
+            self.tree.item(str(index), values=self._values(r), tags=self._tags(r))
+        self._update_summary()
+
+    # ---- editing in the table itself
+    #   Quicklist: click toggles   Status / Fit: click opens a menu
+    #   Track / Town / Last contact: double-click edits in place   Company: double-click renames
+    TEXT_CELLS = ("Track", "Town", "Last contact")
+
+    def _cell_at(self, e) -> tuple[int, str] | None:
+        if self.tree.identify_region(e.x, e.y) != "cell":
+            return None
+        iid, col = self.tree.identify_row(e.y), self.tree.identify_column(e.x)
+        if not iid or not col:
+            return None
+        return int(iid), self.COLUMNS[int(col[1:]) - 1][0]
+
+    def _cell_click(self, e) -> None:
+        self._end_cell_edit()
+        cell = self._cell_at(e)
+        if cell is None:
+            return
+        index, col = cell
+        if col == "Quicklist":
+            self.after_idle(self._toggle_quicklist, index)
+        elif col in ("Status", "Fit"):
+            self.after_idle(self._cell_menu, index, col, e.x_root, e.y_root)
+
+    def _cell_double(self, e) -> str | None:
+        cell = self._cell_at(e)
+        if cell is None:
+            return None
+        index, col = cell
+        if col == "Company":
+            self.after_idle(self._rename)
+        elif col in self.TEXT_CELLS:
+            self.after_idle(self._cell_entry, index, col)
+        return "break"
+
+    def _toggle_quicklist(self, index: int) -> None:
+        r = self.rows[index]
+        self._set_cell(index, "Interesting", "" if companies.is_interesting(r) else "yes")
+
+    def _cell_menu(self, index: int, col: str, x: int, y: int) -> None:
+        r = self.rows[index]
+        values = STATUSES if col == "Status" else FITS
+        values = values + ([r[col]] if r[col] and r[col] not in values else [])
+        self._menu_var = tk.StringVar(value=r[col])
+        menu = tk.Menu(self, tearoff=False, font=self.fonts["body"])
+        for v in values:
+            menu.add_radiobutton(label=v, value=v, variable=self._menu_var,
+                                 command=lambda v=v: self._set_cell(index, col, v))
+        menu.tk_popup(x, y)
+
+    def _cell_entry(self, index: int, col: str) -> None:
+        box = self.tree.bbox(str(index), col)
+        if not box:
+            return
+        x, y, w, h = box
+        entry = tk.Entry(self.tree, relief="flat", font=self.fonts["body"], highlightthickness=1,
+                         highlightcolor=self.colors["accent"], highlightbackground=self.colors["accent"])
+        entry.insert(0, self.rows[index].get(col, ""))
+        entry.select_range(0, "end")
+        entry.place(x=x, y=y, width=max(w, 120), height=h)
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self._end_cell_edit())
+        entry.bind("<Escape>", lambda e: self._end_cell_edit(cancel=True))
+        entry.bind("<FocusOut>", lambda e: self._end_cell_edit())
+        self._cell_edit = (entry, index, col)
+
+    def _end_cell_edit(self, cancel: bool = False) -> None:
+        edit, self._cell_edit = getattr(self, "_cell_edit", None), None
+        if edit is None:
+            return
+        entry, index, col = edit
+        value = entry.get().strip()
+        entry.destroy()
+        if not cancel and index < len(self.rows) and value != self.rows[index].get(col, ""):
+            self._set_cell(index, col, value)
+
+    def _set_cell(self, index: int, col: str, value: str) -> None:
+        """Change one field of a row from the table, and show it in the detail panel too."""
+        self._commit(save=False)                 # keep what is typed in the panel
+        r = self.rows[index]
+        if col == "Status":
+            self.model.set_status(r, value)
+        else:
+            r[col] = value
+        self._update_row(index)
+        if index == self.current:
+            self._show_details(index)
+        self._save()
+
     def _update_summary(self) -> None:
         counts = Counter(r["Status"] for r in self.rows)
         parts = [f"{counts[s]} {s.lower()}" for s in STATUSES if counts[s]]
         parts += [f"{n} {s.lower() or 'no status'}" for s, n in counts.items() if s not in STATUSES]
-        shown = len(self.tree.get_children())
-        self.summary.configure(text=f"{shown} of {len(self.rows)} shown   ·   " + "  ·  ".join(parts))
+        quick = sum(companies.on_quicklist(r) for r in self.rows)
+        visible = len(self.tree.get_children())
+        self.summary.configure(text=f"{visible} of {len(self.rows)} shown   ·   {quick} on the quicklist   ·   "
+                                    + "  ·  ".join(parts))
 
     def _sort(self, column: str) -> None:
         self.sort_reverse = not self.sort_reverse if self.sort_column == column else False
@@ -620,6 +988,20 @@ class CompaniesTab(ttk.Frame):
             arrow = (" ▼" if self.sort_reverse else " ▲") if col == column else ""
             self.tree.heading(col, text=col + arrow)
         self._fill_tree()
+
+    def show_company(self, name: str) -> None:
+        """Select a company (from the quicklist's 'Edit...'), clearing search/filter if they hide it."""
+        row = self.model.find(name)
+        if row is None:
+            return
+        self._commit()
+        self.current = self.rows.index(row)
+        if not self._visible(row):
+            self.search.set("")
+            if row["Status"] in self.status_filter.hidden:
+                self.status_filter._set_hidden(set())
+        self._fill_tree()
+        self._show_details(self.current)
 
     # ---- details
     def _on_select(self) -> None:
@@ -632,14 +1014,15 @@ class CompaniesTab(ttk.Frame):
         self._show_details(index)
 
     def _show_details(self, index: int | None) -> None:
-        r = self.rows[index] if index is not None else None
+        r = self.rows[index] if index is not None and index < len(self.rows) else None
         state = "normal" if r else "disabled"
         self.d_title.configure(text=shown(r["Company"]) if r else "Choose a company")
-        info = [r.get(c, "") for c in ("Fit", "Track", "Town")] if r else []
-        self.d_info.configure(text="   ·   ".join(
-            f"{label}: {shown(v)}" for label, v in zip(("Fit", "Track", "Town"), info) if v))
-        self.d_what.configure(text=shown(r.get("What they do", "")) if r else "")
-        self.d_source.configure(text=r.get("Source", "") if r else "")
+        self.d_interesting.set(companies.is_interesting(r) if r else False)
+        for field, w in self.entries.items():
+            w.configure(state="normal")
+            w.delete(0, "end")
+            w.insert(0, r.get(field, "") if r else "")
+            w.configure(state=state)
         self.d_status.set(r["Status"] if r else "")
         values = STATUSES + ([r["Status"]] if r and r["Status"] and r["Status"] not in STATUSES else [])
         self.status_box.configure(values=values, state="readonly" if r else "disabled")
@@ -652,43 +1035,211 @@ class CompaniesTab(ttk.Frame):
         self.d_notes.insert("1.0", r["Notes"] if r else "")
         self.d_notes.edit_reset()
         self.d_notes.configure(state=state)
-        self.app_btn.configure(state=state if self.on_application else "disabled")
+        for b in (self.rename_btn, self.interest_box, self.today_btn, self.delete_btn):
+            b.configure(state=state)
+        self.open_btn.configure(state=state if self.on_open else "disabled")
+        self._fill_postings()
 
-    def _commit(self, save: bool = True) -> None:
-        """Copy the detail panel into the current row; save if anything changed."""
-        if self.current is None or self.current >= len(self.rows):
+    # ---- job postings of the company in the panel
+    def _selected_posting(self) -> dict[str, str] | None:
+        sel = self.p_tree.selection()
+        postings = self.model.postings(self._row())
+        return postings[int(sel[0])] if sel and int(sel[0]) < len(postings) else None
+
+    def _fill_postings(self, select: str | None = None) -> None:
+        """Rebuild the postings table (also after a posting text is saved somewhere)."""
+        if select is None:
+            p = self._selected_posting()
+            select = p["title"] if p else None
+        self.p_tree.delete(*self.p_tree.get_children())
+        r = self._row()
+        for i, p in enumerate(self.model.postings(r)):
+            has = companies.has_posting_text(r["Company"], p["title"])
+            self.p_tree.insert("", "end", iid=str(i), tags=("saved" if has else "missing",),
+                               values=(shown(p["title"]), "saved" if has else "not created",
+                                       "open" if p["url"] else ""))
+            if p["title"] == select:
+                self.p_tree.selection_set(str(i))
+        self._posting_buttons()
+
+    def _posting_buttons(self) -> None:
+        p = self._selected_posting()
+        self.posting_btns["add"].configure(state="normal" if self._row() else "disabled")
+        for key in ("edit", "remove", "text"):
+            self.posting_btns[key].configure(state="normal" if p else "disabled")
+        self.open_btn.configure(text="Work on this posting in Documents" if p else "Work on it in Documents")
+
+    def _posting_click(self, e) -> None:
+        """A click on 'open' in the Link column opens the posting's web page."""
+        iid = self.p_tree.identify_row(e.y)
+        if iid and self.p_tree.identify_column(e.x) == "#3":
+            postings = self.model.postings(self._row())
+            if int(iid) < len(postings) and postings[int(iid)]["url"]:
+                webbrowser.open(postings[int(iid)]["url"])
+
+    def _add_posting(self) -> None:
+        r = self._row()
+        if r is None:
             return
-        r = self.rows[self.current]
-        new = {"Status": self.d_status.get(), "Last contact": self.d_date.get().strip(),
-               "Notes": self.d_notes.get("1.0", "end-1c").strip()}
-        if all(r[k] == v for k, v in new.items()):
+        self._commit()
+        value = ask_posting(self, self.model, r)
+        if value is None:
             return
+        self.model.add_posting(r, *value)
+        self._save()
+        self._fill_postings(select=value[0])
+
+    def _edit_posting(self) -> None:
+        r, p = self._row(), self._selected_posting()
+        if r is None or p is None:
+            return
+        self._commit()
+        value = ask_posting(self, self.model, r, p["title"], p["url"], heading="Edit job posting")
+        if value is None or value == (p["title"], p["url"]):
+            return
+        try:
+            self.model.edit_posting(r, p["title"], *value)
+        except OSError as e:
+            messagebox.showerror("Edit job posting", f"Could not move the posting's folder:\n{e}", parent=self)
+        PostingTextWindow.renamed(r["Company"], r["Company"], p["title"], value[0])
+        self._save()
+        self._fill_postings(select=value[0])
+
+    def _remove_posting(self) -> None:
+        r, p = self._row(), self._selected_posting()
+        if r is None or p is None:
+            return
+        folder = companies.posting_folder(r["Company"], p["title"])
+        extra = (f"\n\nIts documents in output/{folder.parent.name}/{folder.name}/ are kept."
+                 if folder.is_dir() else "")
+        if not messagebox.askyesno("Remove job posting", f"Remove the posting '{p['title']}' from "
+                                                         f"{r['Company']}?{extra}", parent=self):
+            return
+        self._commit(save=False)
+        self.model.remove_posting(r, p["title"])
+        self._save()
+        self._fill_postings()
+
+    def _posting_text(self) -> None:
+        r, p = self._row(), self._selected_posting()
+        if r is not None and p is not None:
+            PostingTextWindow.show(self, self.model, self.colors, self.fonts, r["Company"], p["title"])
+
+    def _row(self) -> dict[str, str] | None:
+        return self.rows[self.current] if self.current is not None and self.current < len(self.rows) else None
+
+    def _commit(self, save: bool = True) -> bool:
+        """Copy the detail panel into the current row; save if anything changed. True if it changed."""
+        r = self._row()
+        if r is None:
+            return False
+        new = {field: w.get().strip() for field, w in self.entries.items()}
+        new["Last contact"] = self.d_date.get().strip()
+        new["Notes"] = self.d_notes.get("1.0", "end-1c").strip()
+        if all(r.get(k, "") == v for k, v in new.items()):
+            return False
         r.update(new)
-        iid = str(self.current)
-        if self.tree.exists(iid):
-            self.tree.item(iid, values=[shown(r.get(c, "")) for c, _ in self.COLUMNS], tags=(r["Status"],))
-        self._update_summary()
+        self._update_row()
         if save:
             self._save()
+        return True
 
     def _status_changed(self) -> None:
-        if self.current is not None and self.d_status.get() != self.rows[self.current]["Status"] \
-                and self.d_status.get() in CONTACT_STATUSES:
-            self._today(commit=False)
-        self._commit()
+        r = self._row()
+        if r is None:
+            return
+        self._commit(save=False)
+        self.model.set_status(r, self.d_status.get())
+        self.d_date.delete(0, "end")
+        self.d_date.insert(0, r["Last contact"])
+        self._update_row()
+        self._save()
 
-    def _today(self, commit: bool = True) -> None:
+    def _interest_changed(self) -> None:
+        r = self._row()
+        if r is None:
+            return
+        self._commit(save=False)
+        r["Interesting"] = "yes" if self.d_interesting.get() else ""
+        self._update_row()
+        self._save()
+
+    def _today(self) -> None:
         self.d_date.delete(0, "end")
         self.d_date.insert(0, datetime.date.today().isoformat())
-        if commit:
-            self._commit()
+        self._commit()
 
-    def _open_source(self) -> None:
-        url = self.d_source.cget("text").strip()
+    def _open_link(self, field: str) -> None:
+        url = self.entries[field].get().strip()
         if url.startswith(("http://", "https://")):
             webbrowser.open(url)
 
-    def _write_application(self) -> None:
-        if self.current is not None and self.on_application:
+    def _open(self) -> None:
+        r = self._row()
+        if r is not None and self.on_open:
+            p = self._selected_posting()
             self._commit()
-            self.on_application(self.rows[self.current]["Company"])
+            self.on_open(r["Company"], p["title"] if p else None)
+
+    # ---- add / rename / delete
+    def _ask_name(self, title: str, initial: str = "") -> str | None:
+        name = simpledialog.askstring(title, "Company name:", initialvalue=initial, parent=self)
+        name = (name or "").strip()
+        if not name:
+            return None
+        if not companies.folder_name(name):
+            messagebox.showwarning(title, "The name needs at least one letter or digit.", parent=self)
+            return None
+        other = self.model.find(name) or next(
+            (r for r in self.rows if companies.folder_name(r["Company"]) == companies.folder_name(name)), None)
+        if other is not None and other is not self._row():
+            messagebox.showwarning(title, f"'{other['Company']}' is already in the list.", parent=self)
+            self.show_company(other["Company"])
+            return None
+        return name
+
+    def _add(self) -> None:
+        self._commit()
+        name = self._ask_name("Add company")
+        if name is None:
+            return
+        row = self.model.add(name)
+        self.current = self.rows.index(row)
+        self.search.set("")
+        self.status_filter.hidden.discard(row["Status"])
+        self._fill_tree()
+        self._show_details(self.current)
+        self._save()
+        self.entries["Fit"].focus_set()
+
+    def _rename(self) -> None:
+        r = self._row()
+        if r is None:
+            return
+        self._commit()
+        name = self._ask_name("Rename company", r["Company"])
+        if name is None or name == r["Company"]:
+            return
+        PostingTextWindow.renamed(r["Company"], name)
+        try:
+            self.model.rename(r, name)
+        except OSError as e:
+            messagebox.showerror("Rename company", f"Could not move the document folder:\n{e}", parent=self)
+        self._update_row()
+        self.d_title.configure(text=shown(name))
+        self._save()
+
+    def _delete(self) -> None:
+        r = self._row()
+        if r is None:
+            return
+        folder = companies.company_folder(r["Company"])
+        extra = (f"\n\nIts documents in output/{folder.name}/ are kept." if folder.is_dir() else "")
+        if not messagebox.askyesno("Delete company", f"Remove '{r['Company']}' from the company list?{extra}",
+                                   parent=self):
+            return
+        self.model.remove(r)
+        self.current = None
+        self._fill_tree()
+        self._show_details(None)
+        self._save()

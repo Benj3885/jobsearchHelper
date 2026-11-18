@@ -11,10 +11,12 @@ The user writes in Danish or English; answer in the language they use.
 | Path | Content |
 |---|---|
 | `build_cv.py` | Renders `data/cv.yaml` through a Jinja template into LaTeX and compiles it to PDF |
-| `cv_editor.py` | Tkinter desktop editor. Left: document type (Email / Application / CV). Middle: file name, Compile/Preview + Save, preview. Right: text boxes for the chosen type |
-| `tabs.py` | The editor's other tabs: **Job plan** (shows `docs/job-search-plan.md` formatted; "Edit" opens the Markdown source, "Save" writes it back and keeps `.bak`) and **Companies** (`docs/employers.csv` as a table; Status / Last contact / Notes are edited there and saved straight to the CSV; "Write application" opens the application with the company filled in) |
+| `cv_editor.py` | Tkinter desktop editor. Left: document type (Email / Application / CV), language, company quicklist. Middle: file name, Compile/Preview + Save (+ Mark ready for a company), preview. Right: text boxes for the chosen type |
+| `companies.py` | No Tk. `CompanyList`: the rows of `docs/employers.csv`, one instance shared by every tab (listeners are told after each change). Status changes record `Previous status` / `Previous last contact` / `Status changed` so Applied can be undone. Company folders `output/<company>/` and their `company.json` (name + which doc types are ready). Job postings: the `Job postings` column holds one per line, `Title \| URL`; a posting's documents go in `output/<company>/<posting>/` with `posting.json` (title + ready marks) and `job_posting.txt` (the ad's pasted text). `doc_listeners` are told when files change (no CSV change) |
+| `quicklist.py` | Compact block in the Documents tab's left column: a dropdown of companies with `Interesting` set and status before Applied ("No company" = general). A second dropdown picks one of its job postings (or the whole company); `+` adds a posting; titles without a saved posting text are marked. Icons for the chosen company/posting (E/A/CV: pale = none saved, grey = saved, green = ready; click opens that document; P = posting text, green = saved, click opens it), details (contact, email, notes, posting/homepage/source links), "Mark applied" and an "Undo applied" menu with the last 5 |
+| `tabs.py` | The editor's other tabs: **Job plan** (shows `docs/job-search-plan.md` formatted; "Edit" opens the Markdown source, "Save" writes it back and keeps `.bak`) and **Companies** (manage the list: add, rename, delete, edit every field incl. Interesting and Homepage, also in the table itself: click Quicklist/Status/Fit, double-click text cells; saved straight to the CSV; job postings table (add/edit/remove, Posting text column: saved / not created); "Work on it in Documents" selects it, or the selected posting, on the quicklist). Also `PostingTextWindow` (paste and read a posting's text) and `ask_posting` |
 | `documents.py` | Builders for the job application (LaTeX PDF) and email (plain text) |
-| `output/` | Files saved from the editor: `<PREFIX>_<name>_CV.pdf`, `..._APPLICATION.pdf`, `..._EMAIL.txt`. `<PREFIX>` comes from `personal.yaml`; an empty application name uses the company |
+| `output/` | Files saved from the editor: `<PREFIX>_<name>_CV.pdf`, `..._APPLICATION.pdf`, `..._EMAIL.txt`. `<PREFIX>` comes from `personal.yaml`; an empty application name uses the company. With a company selected on the quicklist they go in `output/<company>/`, with a job posting selected in `output/<company>/<posting>/` |
 | `data/personal.yaml` | **Personal information** (name, contact, file prefix). Git-ignored. Template: `data/personal.example.yaml` (made-up) |
 | `data/cv.yaml` | CV content without name/contact (those are merged in from `personal.yaml` by `load_cv`). Edit content here, never in generated `.tex`. Git-ignored |
 | `data/application.yaml`, `data/email.yaml` | Default text for a new application / email, per language (`da`, `en`). `$name`, `$short_name`, `$phone`, `$email`, `$location` are filled in from `personal.yaml`. Git-ignored |
@@ -49,6 +51,14 @@ python build_cv.py --tex-only                        # render .tex without compi
 - Required fields (`REQUIRED` in `cv_editor.py`, marked with a red *) block **saving**, not compiling,
   while they contain a `[placeholder]`. Emptying or replacing it unblocks. Save checks the compiled
   version, since that is what gets saved.
+- Company mode: picking a company on the quicklist loads the newest saved document of each type from
+  its folder (boxes + preview); types with nothing saved get default text with company / contact person /
+  email from the CSV. Picking a job posting does the same with the posting's subfolder (types not saved
+  for the posting get default text, not the company's general version). It asks before discarding unsaved box edits. In company mode Save is never
+  blocked; required-field placeholders only block "Mark ready", and saving a version with placeholders
+  unmarks it. A company that leaves the quicklist (applied, deleted, renamed) stops being the active one;
+  a posting that is renamed or removed stops being active (back to the whole company). Renaming a posting
+  moves its folder.
 - Language (Dansk/English) is chosen on the left. It swaps the default text of email and application
   (asking first if edited) and fixed words in the output (`LABELS` in `documents.py`). The CV text is English only.
 - The program is built incrementally: each request is one step, not the finished program. The left

@@ -11,6 +11,10 @@ Run with:  python cv_editor.py      (needs a Python with tkinter, e.g. the conda
   asking first if the file exists. PDFs carry the box contents as an attachment, so
   "Import..." can fill the boxes again from a saved PDF (or from an email .txt).
 - "Save as default" writes the boxes back to the YAML file (backup in <file>.yaml.bak).
+- The quicklist on the left (quicklist.py) picks a company to work on. Its documents are saved in
+  output/<company>/, and picking it again loads them back (boxes and preview). Saving there is
+  never blocked; placeholders in required fields only block "Mark ready".
+  A job posting of the company can be picked too: its documents go in output/<company>/<posting>/.
 """
 
 from __future__ import annotations
@@ -27,7 +31,9 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
 import build_cv
+import companies
 import documents
+import quicklist
 import tabs
 
 ROOT = build_cv.ROOT
@@ -106,11 +112,16 @@ def output_file_name(prefix: str, name: str, suffix: str, ext: str) -> str:
     return "_".join(part for part in (prefix, name) if part) + suffix + ext
 
 
+def _rel(path: Path) -> str:
+    """Path for messages: relative to the project folder when it is inside it."""
+    return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+
+
 def name_from_company(company: str) -> str:
     """'Trackunit A/S' -> 'Trackunit_AS' (usable in a file name). Empty if it is a [placeholder]."""
     if PLACEHOLDER.search(company):
         return ""
-    return re.sub(r"\s+", "_", re.sub(r"[/\\:*?\"<>|]", "", company.strip()))
+    return companies.folder_name(company)
 
 
 # --------------------------------------------------------------------------- cv.yaml <-> boxes
@@ -325,6 +336,9 @@ class ModeState:
         self.file_name = tk.StringVar(value=DEFAULT_FILE_NAME)
         self.status = "Edit the text and press Compile."
         self.loaded_defaults: dict[str, str] = {}     # what the boxes were last filled with
+        self.baseline: dict[str, str] = {}            # boxes as last loaded or saved (unsaved-edits check)
+        self.saved_form: dict[str, str] = {}          # content of saved_path
+        self.saved_path: Path | None = None          # file in the company folder shown in the boxes
         self.required: set[str] = REQUIRED.get(key, set())
         self.labels = {k: lbl for k, lbl, *_ in fields}
         self.pending_form: dict[str, str] = {}        # form being compiled
@@ -361,6 +375,9 @@ class Editor(tk.Tk):
         self.base_cv = build_cv.load_cv(self.personal)
         self.modes = {m[0]: ModeState(*m) for m in MODES}
         self.mode = self.modes["cv"]
+        self.model = companies.CompanyList()
+        self.company: str | None = None          # company being worked on (quicklist); None = general
+        self.posting: str | None = None          # job posting of that company; None = the whole company
 
         self.language = "da"
         self.track = tk.StringVar(value=next(iter(self.base_cv["tracks"])))
@@ -373,8 +390,8 @@ class Editor(tk.Tk):
         self.notebook.add(self.documents_tab, text="Documents")
         self.plan_tab = tabs.PlanTab(self.notebook, COLORS, self.fonts)
         self.notebook.add(self.plan_tab, text="Job plan")
-        self.companies_tab = tabs.CompaniesTab(self.notebook, COLORS, self.fonts,
-                                               on_application=self._start_application)
+        self.companies_tab = tabs.CompaniesTab(self.notebook, COLORS, self.fonts, self.model,
+                                               on_open=self.open_company)
         self.notebook.add(self.companies_tab, text="Companies", padding=(0, 10, 0, 0))
         self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
 
@@ -389,10 +406,11 @@ class Editor(tk.Tk):
         self._fill_defaults(self.modes["application"])
         self._fill_defaults(self.modes["email"])
         self._switch_mode("cv")
+        self.model.listeners.append(self._model_changed)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _close(self) -> None:
-        if not self.plan_tab.confirm_close():
+        if not self.plan_tab.confirm_close() or not tabs.PostingTextWindow.confirm_close_all():
             return
         self.companies_tab._commit()       # notes typed but not yet saved
         remove_previews()
@@ -400,20 +418,190 @@ class Editor(tk.Tk):
 
     def _tab_changed(self, event) -> None:
         """Reload the plan / company list if the file was changed outside the editor."""
+        self.companies_tab._commit()         # edits in its detail panel, before another tab changes the list
         tab = self.nametowidget(self.notebook.select())
-        if tab in (self.plan_tab, self.companies_tab):
+        if tab is self.plan_tab:
             tab.refresh()
+        else:
+            self.companies_tab.refresh()
 
-    def _start_application(self, company: str) -> None:
-        """From the Companies tab: open the application with the company filled in."""
+    # ---- company being worked on
+    def open_company(self, name: str, posting: str | None = None) -> None:
+        """From the Companies tab: put the company on the quicklist and work on it (or on one posting)."""
+        row = self.model.find(name)
+        if row is not None and not companies.is_interesting(row):
+            row["Interesting"] = "yes"
+            self.model.save(source=self)
         self.notebook.select(self.documents_tab)
-        state = self.modes["application"]
-        if self.mode is not state:
-            self._switch_mode("application")
-        self._set(state, "company", company)
+        self.select_company(name, None, posting)
+
+    def _edit_company(self, name: str) -> None:
+        """From the quicklist: show the company in the Companies tab."""
+        self.notebook.select(self.companies_tab)
+        self.companies_tab.show_company(name)
+
+    def _model_changed(self, source) -> None:
+        """The company left the quicklist (applied, renamed, deleted...): stop working on it.
+        The same for a posting that was renamed or removed: back to the whole company."""
+        if self.company is not None and not any(r["Company"] == self.company for r in self.model.quicklist()):
+            self.company = self.posting = None
+            self._set_file_names("")
+            msg = "No company selected: saving goes to output/ again."
+        elif self.posting is not None and not any(
+                p["title"] == self.posting for p in self.model.postings(self.model.find(self.company))):
+            self.posting = None
+            msg = (f"The posting was renamed or removed: saving goes to "
+                   f"output/{companies.folder_name(self.company)}/ now.")
+        else:
+            return
+        for state in self.modes.values():
+            state.saved_path, state.saved_form = None, {}
+        self.quicklist.set_active(self.company, None)
+        self._update_company_ui()
+        self._set_status(self.mode, msg)
+
+    def _unsaved(self) -> list[ModeState]:
+        return [st for st in self.modes.values() if st.baseline and self._form(st) != st.baseline]
+
+    def _where(self) -> str:
+        """The folder documents are saved in, for messages: 'output/<company>/[<posting>/]'."""
+        return _rel(companies.doc_folder(self.company, self.posting)) + "/" if self.company else "output/"
+
+    def select_company(self, name: str | None, doc_type: str | None = None, posting: str | None = None) -> bool:
+        """Work on `name` (None = no company), or on one of its job postings. Loads the saved documents
+        into the boxes and the preview; types without a saved document get the default text with the
+        company filled in."""
+        posting = posting if name else None
+        if name == self.company and posting == self.posting:
+            if doc_type:
+                self._switch_mode(doc_type)
+            return True
+        if name is not None:
+            changed = self._unsaved()
+            what = f"'{posting}' at {name}" if posting else name
+            if changed and not messagebox.askyesno(
+                    "Unsaved changes",
+                    f"The {' and '.join(st.label for st in changed)} text has changes that are not saved.\n\n"
+                    f"Load {what} and discard them?"):
+                return False
+        if name != self.company:
+            self._set_file_names(companies.folder_name(name) if name else "")
+        self.company, self.posting = name, posting
+        self.quicklist.set_active(name, posting)
+        if name is None:            # keep the boxes; only where they are saved changes
+            for state in self.modes.values():
+                state.saved_path, state.saved_form = None, {}
+        else:
+            loaded = []
+            for state in self.modes.values():
+                path = companies.latest_file(name, state.key, posting)
+                if path is not None and self._load_saved(state, path):
+                    loaded.append(state.label)
+                else:
+                    self._reset_document(state)
+            note = (f"Loaded {', '.join(loaded)} from {self._where()}" if loaded else
+                    f"Nothing saved for this {'posting' if posting else 'company'} yet; "
+                    "the boxes have the default text.")
+            for state in self.modes.values():
+                state.status = note
+        self._switch_mode(doc_type or self.mode.key)
+        self._update_company_ui()
+        return True
+
+    def _set_file_names(self, name: str) -> None:
+        for state in self.modes.values():
+            state.file_name.set(name)
         self.name_entry.delete(0, "end")
-        self.name_entry.insert(0, name_from_company(company))
-        self._mark_dirty(state)
+        self.name_entry.insert(0, name)
+
+    def _reset_document(self, state: ModeState) -> None:
+        """Default text (with the company's details) and no compiled preview."""
+        self._fill_defaults(state)
+        state.result, state.images, state.rendered_width = None, [], 0
+        state.compiled_form, state.saved_form, state.saved_path = {}, {}, None
+
+    def _load_saved(self, state: ModeState, path: Path) -> bool:
+        """Fill the boxes and the preview from a document saved in the company folder."""
+        if path.suffix.lower() == ".txt":
+            fields, lang = documents.parse_email_txt(path.read_text(encoding="utf-8"))
+            data = {"type": "email", "lang": lang, "fields": fields}
+        else:
+            data = documents.read_embedded(path)
+        if not data or data.get("type") != state.key:
+            return False
+        for key, *_ in state.fields:
+            self._set(state, key, data["fields"].get(key, ""))
+        if data.get("style") in state.styles:
+            state.style.set(data["style"])
+        if state.key == "cv" and data.get("track") in self.base_cv["tracks"]:
+            self.track.set(data["track"])
+        if state.key != "cv" and data.get("lang") in documents.LANGUAGES and data["lang"] != self.language:
+            self.language = data["lang"]
+            self._update_lang_buttons()
+        form = self._form(state)
+        state.baseline = state.saved_form = state.compiled_form = form
+        state.saved_path = path
+        state.preview_dir.mkdir(parents=True, exist_ok=True)
+        state.result = state.preview_dir / f"preview{path.suffix.lower()}"
+        shutil.copyfile(path, state.result)
+        state.images, state.rendered_width = [], 0
+        if state.is_pdf:
+            self._render_async(state, state.result)
+        self._validate(state)
+        return True
+
+    def _render_async(self, state: ModeState, pdf: Path) -> None:
+        width = self._preview_page_width()
+        state.rendered_width = width
+
+        def work():
+            try:
+                render_pages(pdf, state.preview_dir, width)
+            except Exception:
+                return
+            self.after(0, self._rerendered, state, width)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_company_ui(self) -> None:
+        """Folder in front of the file name, and the Ready button (only for a company)."""
+        if self.company:
+            folder = companies.doc_folder(self.company, self.posting).relative_to(companies.OUTPUT)
+            self.folder_label.set(f"{folder.as_posix()}/{self.file_prefix}_")
+            self.ready_btn.pack(side="left", padx=(8, 0))
+        else:
+            self.folder_label.set(f"{self.file_prefix}_")
+            self.ready_btn.pack_forget()
+        self._validate(self.mode)
+
+    def _toggle_ready(self) -> None:
+        state, company, posting = self.mode, self.company, self.posting
+        if company is None:
+            return
+        if companies.is_ready(company, state.key, posting):
+            companies.set_ready(company, state.key, False, posting)
+            self._set_status(state, f"{state.label} is no longer marked ready.")
+        else:
+            if state.saved_path is None or not state.saved_path.exists():
+                messagebox.showwarning("Mark ready", f"Save the {state.label.lower()} first. "
+                                                     "'Ready' is about the saved file.")
+                return
+            problems = placeholder_problems(state.saved_form, state.required)
+            if problems:
+                lines = "\n".join(f"  - {state.labels[k]}: {', '.join(PLACEHOLDER.findall(state.saved_form[k])[:3])}"
+                                  for k in problems)
+                messagebox.showerror("Can't mark ready",
+                                     f"The saved {state.label.lower()} still has placeholders in required fields:"
+                                     f"\n\n{lines}\n\nReplace or remove them, compile, save, then mark it ready.")
+                return
+            if self._form(state) != state.saved_form and not messagebox.askyesno(
+                    "Mark ready", "The boxes have changed since the last save.\n\n"
+                                  "Mark the saved version ready anyway?"):
+                return
+            companies.set_ready(company, state.key, True, posting)
+            self._set_status(state, f"{state.label} marked ready ({state.saved_path.name}).")
+        self.model.documents_changed()
+        self._validate(state)
 
     def _initial_columns(self, event) -> None:
         """Set column widths once, when the window has its real size: left 300px, boxes 540px."""
@@ -461,6 +649,11 @@ class Editor(tk.Tk):
         self.lang_note = ttk.Label(inner, text="", style="Help.Card.TLabel", wraplength=260, justify="left")
         self.lang_note.pack(anchor="w", pady=(8, 0))
         self._update_lang_buttons()
+
+        card = self._card(self.left_panel, fill="x", pady=(10, 0))
+        self.quicklist = quicklist.Quicklist(card, self.model, COLORS, self.fonts,
+                                             on_select=self.select_company, on_edit=self._edit_company)
+        self.quicklist.pack(fill="x")
         return self.left_panel
 
     # ---- language
@@ -498,7 +691,8 @@ class Editor(tk.Tk):
         row = ttk.Frame(bar, style="Card.TFrame", padding=(14, 12, 14, 6))
         row.pack(fill="x")
         ttk.Label(row, text="File name", style="Field.Card.TLabel").pack(side="left")
-        ttk.Label(row, text=f"{self.file_prefix}_", style="Help.Card.TLabel").pack(side="left", padx=(10, 2))
+        self.folder_label = tk.StringVar(value=f"{self.file_prefix}_")     # "<company folder>/" in front
+        ttk.Label(row, textvariable=self.folder_label, style="Help.Card.TLabel").pack(side="left", padx=(10, 2))
         self.name_entry = ttk.Entry(row, width=12)
         self.name_entry.pack(side="left", fill="x", expand=True)
         ttk.Label(row, textvariable=self.suffix_label, style="Help.Card.TLabel").pack(side="left", padx=(4, 0))
@@ -509,6 +703,7 @@ class Editor(tk.Tk):
         self.compile_btn.pack(side="left")
         self.save_btn = ttk.Button(buttons, text="Save", command=self._save, state="disabled")
         self.save_btn.pack(side="left", padx=(8, 0))
+        self.ready_btn = ttk.Button(buttons, text="Mark ready", command=self._toggle_ready)   # packed for a company
         status = ttk.Label(bar, textvariable=self.status, style="Status.Card.TLabel", padding=(14, 2, 14, 2))
         status.pack(fill="x")
         # Row 3: why saving is blocked (empty when it isn't)
@@ -733,9 +928,17 @@ class Editor(tk.Tk):
     def _fill_defaults(self, state: ModeState) -> None:
         values = (cv_to_form(self.base_cv, self.track.get()) if state.key == "cv"
                   else documents.load_defaults(state.key, self.language, self.personal))
+        row = self.model.find(self.company) if getattr(self, "company", None) else None
+        if row is not None:                  # fill in what the company list knows
+            if state.key == "application":
+                values["company"] = row["Company"]
+                if row.get("Contact person"):
+                    values["recipient"] = row["Contact person"]
+            elif state.key == "email" and row.get("Email"):
+                values["to"] = row["Email"]
         for key, *_ in state.fields:
             self._set(state, key, values.get(key, ""))
-        state.loaded_defaults = self._form(state)
+        state.loaded_defaults = state.baseline = self._form(state)
         self._validate(state)
 
     def _load_cv_track(self) -> None:
@@ -788,7 +991,10 @@ class Editor(tk.Tk):
     def _import(self, state: ModeState) -> None:
         """Fill the boxes from a PDF saved by the editor, or from an email .txt."""
         path = filedialog.askopenfilename(
-            parent=self, title="Import file", initialdir=str(OUTPUT if OUTPUT.exists() else ROOT),
+            parent=self, title="Import file", initialdir=str(next(
+                d for d in (companies.doc_folder(self.company, self.posting) if self.company else None,
+                            companies.company_folder(self.company) if self.company else None, OUTPUT, ROOT)
+                if d is not None and d.exists())),
             filetypes=[("Saved documents", "*.pdf *.txt"), ("PDF", "*.pdf"), ("Text", "*.txt")])
         if not path:
             return
@@ -828,6 +1034,7 @@ class Editor(tk.Tk):
         else:
             self.name_entry.delete(0, "end")
             self.name_entry.insert(0, name)
+        target.baseline = self._form(target)
         self._mark_dirty(target)
         self._set_status(target, f"Imported {path.name}. Press Compile to see it.")
 
@@ -848,6 +1055,9 @@ class Editor(tk.Tk):
                 w.configure(style="Invalid.TEntry" if bad else "TEntry")
         if state is not self.mode:
             return
+        if getattr(self, "company", None):            # saving always works; placeholders block "ready"
+            self._validate_ready(state, live)
+            return
         compiled = placeholder_problems(state.compiled_form, state.required) if state.result else []
         if live:
             text = "Can't save: placeholders in " + ", ".join(state.labels[k] for k in live)
@@ -857,6 +1067,25 @@ class Editor(tk.Tk):
             text = ""
         self.block_label.configure(text=text)
         self.save_btn.configure(style="Blocked.TButton" if text else "TButton")
+
+    def _validate_ready(self, state: ModeState, live: list[str]) -> None:
+        ready = companies.is_ready(self.company, state.key, self.posting)
+        saved = placeholder_problems(state.saved_form, state.required) if state.saved_path else []
+        if ready:
+            text = ""
+        elif live:
+            text = "Not ready yet: placeholders in " + ", ".join(state.labels[k] for k in live) + \
+                   " (saving works)"
+        elif saved:
+            text = "The saved version has placeholders: compile and save again before marking it ready"
+        else:
+            text = ""
+        self.block_label.configure(text=text)
+        self.save_btn.configure(style="TButton")
+        blocked = not ready and (state.saved_path is None or bool(saved))
+        self.ready_btn.configure(text="Ready (click to undo)" if ready else "Mark ready",
+                                 style="Blocked.TButton" if blocked and (live or saved) else
+                                 "Accent.TButton" if ready else "TButton")
 
     def _mark_dirty(self, state: ModeState) -> None:
         self._validate(state)
@@ -1004,6 +1233,9 @@ class Editor(tk.Tk):
         if not state.result or not state.result.exists():
             messagebox.showwarning("Nothing to save", "Compile first.")
             return
+        if self.company:
+            self._save_for_company(state)
+            return
         problems = placeholder_problems(state.compiled_form, state.required)
         if problems:
             lines = "\n".join(f"  - {state.labels[k]}: {', '.join(PLACEHOLDER.findall(state.compiled_form[k])[:3])}"
@@ -1020,11 +1252,42 @@ class Editor(tk.Tk):
             messagebox.showwarning("Invalid name", "Enter a file name without / \\ : * ? \" < > |")
             return
         dest = OUTPUT / output_file_name(self.file_prefix, name, state.suffix, state.ext)
-        if dest.exists() and not messagebox.askyesno("File exists", f"{dest.relative_to(ROOT)} already exists.\nReplace it?"):
+        if dest.exists() and not messagebox.askyesno("File exists", f"{_rel(dest)} already exists.\nReplace it?"):
             return
         OUTPUT.mkdir(exist_ok=True)
         shutil.copyfile(state.result, dest)
-        self._set_status(state, f"Saved {dest.relative_to(ROOT)}")
+        state.baseline = state.compiled_form
+        self._set_status(state, f"Saved {_rel(dest)}")
+
+    def _save_for_company(self, state: ModeState) -> None:
+        """Save into output/<company>/ (or its posting's subfolder). Never blocked; a version with
+        placeholders is not ready."""
+        company, posting = self.company, self.posting
+        folder = companies.doc_folder(company, posting)
+        name = self.name_entry.get().strip() or companies.folder_name(company)
+        if re.search(r"[/\\:*?\"<>|]", name):
+            messagebox.showwarning("Invalid name", "Enter a file name without / \\ : * ? \" < > |")
+            return
+        dest = folder / output_file_name(self.file_prefix, name, state.suffix, state.ext)
+        if dest.exists() and dest != state.saved_path and not messagebox.askyesno(
+                "File exists", f"{_rel(dest)} already exists.\nReplace it?"):
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(state.result, dest)
+        companies.write_meta(company, posting)
+        state.saved_path, state.saved_form = dest, state.compiled_form
+        state.baseline = state.compiled_form
+        msg = f"Saved {_rel(dest)}"
+        problems = placeholder_problems(state.saved_form, state.required)
+        if problems:
+            if companies.is_ready(company, state.key, posting):
+                companies.set_ready(company, state.key, False, posting)
+                msg += " (no longer marked ready: it has placeholders)"
+            else:
+                msg += ". Placeholders left in " + ", ".join(state.labels[k] for k in problems)
+        self._set_status(state, msg)
+        self.model.documents_changed()
+        self._validate(state)
 
 
 if __name__ == "__main__":
