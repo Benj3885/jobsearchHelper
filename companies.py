@@ -37,7 +37,7 @@ FITS = ["High", "Medium", "Low"]
 
 # Columns the program uses. Missing ones are added (empty) when the file is read; other columns are kept.
 COLUMNS = ["Company", "Fit", "Track", "Town", "What they do", "Status", "Last contact", "Contact person",
-           "Email", "Notes", "Source", "Homepage", "Job postings", "Interesting", "Previous status",
+           "Email", "Notes", "Past postings", "Found via", "Homepage", "Job postings", "Interesting", "Previous status",
            "Previous last contact", "Status changed"]
 
 # Document type -> (file name suffix, extension). Same as the editor's MODES.
@@ -45,6 +45,16 @@ DOC_TYPES = {"email": ("_EMAIL", ".txt"), "application": ("_APPLICATION", ".pdf"
 META = "company.json"
 POSTING_META = "posting.json"
 POSTING_TEXT = "job_posting.txt"
+
+
+# "Past postings" holds one earlier job ad per line. Lines starting with this are remarks, not ads.
+PAST_NOTE = "Note:"
+
+
+def count_past_postings(row: dict[str, str] | None) -> int:
+    """Number of earlier job ads in the row's 'Past postings' (non-empty lines that aren't a 'Note:')."""
+    lines = (row or {}).get("Past postings", "").splitlines()
+    return sum(1 for line in lines if line.strip() and not line.strip().startswith(PAST_NOTE))
 
 
 # --------------------------------------------------------------------------- employers.csv

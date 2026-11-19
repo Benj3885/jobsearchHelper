@@ -13,13 +13,14 @@ The user writes in Danish or English; answer in the language they use.
 | `build_cv.py` | Renders `data/cv.yaml` through a Jinja template into LaTeX and compiles it to PDF |
 | `cv_editor.py` | Tkinter desktop editor. Left: document type (Email / Application / CV), language, company quicklist. Middle: file name, Compile/Preview + Save (+ Mark ready for a company), preview. Right: text boxes for the chosen type |
 | `companies.py` | No Tk. `CompanyList`: the rows of `docs/employers.csv`, one instance shared by every tab (listeners are told after each change). Status changes record `Previous status` / `Previous last contact` / `Status changed` so Applied can be undone. Company folders `output/<company>/` and their `company.json` (name + which doc types are ready). Job postings: the `Job postings` column holds one per line, `Title \| URL`; a posting's documents go in `output/<company>/<posting>/` with `posting.json` (title + ready marks) and `job_posting.txt` (the ad's pasted text). `doc_listeners` are told when files change (no CSV change) |
-| `quicklist.py` | Compact block in the Documents tab's left column: a dropdown of companies with `Interesting` set and status before Applied ("No company" = general). A second dropdown picks one of its job postings (or the whole company); `+` adds a posting; titles without a saved posting text are marked. Icons for the chosen company/posting (E/A/CV: pale = none saved, grey = saved, green = ready; click opens that document; P = posting text, green = saved, click opens it), details (contact, email, notes, posting/homepage/source links), "Mark applied" and an "Undo applied" menu with the last 5 |
-| `tabs.py` | The editor's other tabs: **Job plan** (shows `docs/job-search-plan.md` formatted; "Edit" opens the Markdown source, "Save" writes it back and keeps `.bak`) and **Companies** (manage the list: add, rename, delete, edit every field incl. Interesting and Homepage, also in the table itself: click Quicklist/Status/Fit, double-click text cells; saved straight to the CSV; job postings table (add/edit/remove, Posting text column: saved / not created); "Work on it in Documents" selects it, or the selected posting, on the quicklist). Also `PostingTextWindow` (paste and read a posting's text) and `ask_posting` |
+| `quicklist.py` | Compact block in the Documents tab's left column: a dropdown of companies with `Interesting` set and status before Applied ("No company" = general). A second dropdown picks one of its job postings (or the whole company); `+` adds a posting; titles without a saved posting text are marked. Icons for the chosen company/posting (E/A/CV: pale = none saved, grey = saved, green = ready; click opens that document; P = posting text, green = saved, click opens it), details (contact, email, notes, posting/homepage/found-via links, shown as the full URL; "Past postings" collapsed behind show/hide, URLs in it clickable), "Mark applied" and an "Undo applied" menu with the last 5 |
+| `tabs.py` | The editor's other tabs: **Job plan** (shows `docs/job-search-plan.md` formatted; "Edit" opens the Markdown source, "Save" writes it back and keeps `.bak`) and **Companies** (manage the list: add, rename, delete, edit every field incl. Interesting, Homepage and Past postings (free text: what the company advertised before, closed ads too, one per line; lines starting with `Note:` are remarks and not counted, `companies.count_past_postings`), table columns Postings / Earlier count current and earlier postings (sortable, most first), in the detail panel Job postings / Notes / Past postings are tabs sharing the space left below the fields, also in the table itself: click Quicklist/Status/Fit, double-click text cells; saved straight to the CSV; job postings table (add/edit/remove, Posting text column: saved / not created); "Work on it in Documents" selects it, or the selected posting, on the quicklist). Also `PostingTextWindow` (paste and read a posting's text) and `ask_posting` |
 | `documents.py` | Builders for the job application (LaTeX PDF) and email (plain text) |
 | `output/` | Files saved from the editor: `<PREFIX>_<name>_CV.pdf`, `..._APPLICATION.pdf`, `..._EMAIL.txt`. `<PREFIX>` comes from `personal.yaml`; an empty application name uses the company. With a company selected on the quicklist they go in `output/<company>/`, with a job posting selected in `output/<company>/<posting>/` |
 | `data/personal.yaml` | **Personal information** (name, contact, file prefix). Git-ignored. Template: `data/personal.example.yaml` (made-up) |
 | `data/cv.yaml` | CV content without name/contact (those are merged in from `personal.yaml` by `load_cv`). Edit content here, never in generated `.tex`. Git-ignored |
 | `data/application.yaml`, `data/email.yaml` | Default text for a new application / email, per language (`da`, `en`). `$name`, `$short_name`, `$phone`, `$email`, `$location` are filled in from `personal.yaml`. Git-ignored |
+| `data/application_templates.yaml`, `data/email_templates.yaml` | Named templates besides the default text ("Default" = the files above): `name -> da/en -> boxes`, same `$variables`. A template may have one language only (the other falls back to Default). Created/saved/renamed/deleted from the editor (`documents.save_template` etc.). Optional (missing = only Default), git-ignored |
 | `make_examples.py` | Builds every template's example PDF into `templates/` from made-up data only |
 | `data/*.example.yaml` | Made-up versions of every data file (fictional person, town and companies). Used for the example PDFs, and in place of any real data file that is missing (`build_cv.data_file`), e.g. in a fresh clone. Keep their structure in sync with the real files |
 | `templates/cv_<name>.tex.j2` | CV templates (Jinja + LaTeX) |
@@ -46,8 +47,10 @@ python build_cv.py --tex-only                        # render .tex without compi
   the CV boxes. CV mode supports the templates whose fields match its boxes (`TEMPLATES`).
 - PDFs built by the editor carry the box contents as an attachment (`editor-data.json`, written by
   `build_document(embed=...)`); Import reads it with `pdfdetach`. Email `.txt` files are parsed directly.
-- "Save as default" writes the boxes back to `data/*.yaml` after confirmation, keeping `<file>.yaml.bak`.
-  YAML comments are lost when that happens.
+- Email and application have a Template dropdown above the boxes ("Default" + named templates).
+  Picking one fills the boxes (asks first if they were edited); the language switch reloads the same
+  template. "Save template" / "Save as new..." / "Rename..." / "Delete" write `data/*.yaml` after
+  confirmation, keeping `<file>.yaml.bak`. CV has "Save as default" instead. YAML comments are lost.
 - Required fields (`REQUIRED` in `cv_editor.py`, marked with a red *) block **saving**, not compiling,
   while they contain a `[placeholder]`. Emptying or replacing it unblocks. Save checks the compiled
   version, since that is what gets saved.
@@ -70,6 +73,9 @@ python build_cv.py --tex-only                        # render .tex without compi
   "Save as default" splits the CV (`build_cv.save_cv`) and turns personal details in email/application
   text back into `$variables` (`documents.to_variables`). See `.gitignore` for what else is ignored
   (`docs/`, `output/`, `build/`, root PDFs, `*.bak`).
+- Links in the UI are shown as the full URL, which is itself clickable (`tabs.LinkLabel`, or the URL as
+  text in tables/text boxes). Never label a link only "open", "open link", "click here" or similar,
+  unless the user asks for it for a specific place.
 - Keep it simple: no web server. Ask before adding a new library dependency.
 - Templates and their engines are registered in `TEMPLATE_CHOICES` in `build_cv.py`.
 - Tracks (`robotics_vision`, `software`) are defined under `tracks:` in `cv.yaml` and change

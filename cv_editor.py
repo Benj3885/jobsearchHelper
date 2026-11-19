@@ -10,7 +10,10 @@ Run with:  python cv_editor.py      (needs a Python with tkinter, e.g. the conda
 - "Save" copies it to output/: <name>_CV.pdf, <name>_APPLICATION.pdf or <name>_EMAIL.txt,
   asking first if the file exists. PDFs carry the box contents as an attachment, so
   "Import..." can fill the boxes again from a saved PDF (or from an email .txt).
-- "Save as default" writes the boxes back to the YAML file (backup in <file>.yaml.bak).
+- Email and application start from a template: "Default" (data/email.yaml, data/application.yaml)
+  or a named one (data/<type>_templates.yaml), picked, saved, created, renamed and deleted in the
+  boxes panel. Saving writes the boxes back to the YAML file (backup in <file>.yaml.bak).
+- CV: "Save as default" writes the boxes back to data/cv.yaml and data/personal.yaml.
 - The quicklist on the left (quicklist.py) picks a company to work on. Its documents are saved in
   output/<company>/, and picking it again loads them back (boxes and preview). Saving there is
   never blocked; placeholders in required fields only block "Mark ready".
@@ -27,7 +30,7 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
 import build_cv
@@ -350,6 +353,12 @@ class ModeState:
         self.styles = (TEMPLATES if key == "cv" else
                        list(documents.APPLICATION_TEMPLATES) if key == "application" else [])
         self.style = tk.StringVar(value=self.styles[0] if self.styles else "")
+        # Email/application: the template the boxes start from (documents.template_names)
+        self.template = tk.StringVar(value=documents.DEFAULT_TEMPLATE)
+        self.active_template = documents.DEFAULT_TEMPLATE   # the one the boxes were last filled from
+        self.template_box: ttk.Combobox | None = None
+        self.template_buttons: dict[str, ttk.Button] = {}
+        self.template_info = tk.StringVar()
 
     @property
     def is_pdf(self) -> bool:
@@ -668,19 +677,21 @@ class Editor(tk.Tk):
             return
         self.language = code
         self._update_lang_buttons()
-        # Swap the default text of email and application. Ask before replacing text the user edited.
+        # Swap the template text of email and application. Ask before replacing text the user edited.
         states = [self.modes["email"], self.modes["application"]]
         edited = [st for st in states if self._form(st) != st.loaded_defaults]
         if edited:
             names = " and ".join(st.label for st in edited)
             if not messagebox.askyesno(
                     "Change language",
-                    f"Replace the {names} text with the {documents.LANGUAGES[code]} default text?\n"
+                    f"Replace the {names} text with the {documents.LANGUAGES[code]} text of its template?\n"
                     "Your edits there will be lost. Choose No to keep the current text."):
                 states = [st for st in states if st not in edited]
         for st in states:
             self._fill_defaults(st)
             self._mark_dirty(st)
+        for st in (self.modes["email"], self.modes["application"]):
+            self._update_template_ui(st)
 
     # ---- middle: file name + buttons above the preview
     def _build_preview(self, parent) -> ttk.Frame:
@@ -749,12 +760,14 @@ class Editor(tk.Tk):
         ttk.Label(head, text=state.label, style="Title.Card.TLabel").pack(side="left")
         ttk.Button(head, text="Import...", command=lambda: self._import(state)).pack(side="right")
 
-        source = self._source_name(state)
-        actions = ttk.Frame(frame, style="Card.TFrame", padding=(16, 2, 16, 6))
-        actions.pack(fill="x")
-        ttk.Label(actions, text=f"Default text ({source}):", style="Help.Card.TLabel").pack(side="left")
-        ttk.Button(actions, text="Save as default", command=lambda: self._save_defaults(state)).pack(side="right")
-        ttk.Button(actions, text="Reload", command=lambda: self._reload(state)).pack(side="right", padx=(0, 6))
+        if state.key == "cv":
+            actions = ttk.Frame(frame, style="Card.TFrame", padding=(16, 2, 16, 6))
+            actions.pack(fill="x")
+            ttk.Label(actions, text="Default text (cv.yaml):", style="Help.Card.TLabel").pack(side="left")
+            ttk.Button(actions, text="Save as default", command=lambda: self._save_defaults(state)).pack(side="right")
+            ttk.Button(actions, text="Reload", command=lambda: self._reload(state)).pack(side="right", padx=(0, 6))
+        else:
+            self._build_template_bar(frame, state)
 
         if state.styles:
             opts = ttk.Frame(frame, style="Card.TFrame", padding=(16, 2, 16, 8))
@@ -809,6 +822,122 @@ class Editor(tk.Tk):
             state.widgets[key] = w
             row += 1
         return frame
+
+    def _build_template_bar(self, parent, state: ModeState) -> None:
+        """Template dropdown + Reload, then Save / Save as new / Rename / Delete (email, application)."""
+        bar = ttk.Frame(parent, style="Card.TFrame", padding=(16, 2, 16, 6))
+        bar.pack(fill="x")
+        bar.columnconfigure(1, weight=1)
+        ttk.Label(bar, text="Template", style="Help.Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        box = ttk.Combobox(bar, textvariable=state.template, state="readonly", width=24)
+        box.grid(row=0, column=1, sticky="ew")
+        box.bind("<<ComboboxSelected>>", lambda e: self._choose_template(state))
+        state.template_box = box
+        ttk.Button(bar, text="Reload", command=lambda: self._reload(state)).grid(row=0, column=2, padx=(6, 0))
+
+        buttons = ttk.Frame(bar, style="Card.TFrame")
+        buttons.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        for key, text, command in (("save", "Save template", self._save_template),
+                                   ("new", "Save as new...", self._new_template),
+                                   ("rename", "Rename...", self._rename_template),
+                                   ("delete", "Delete", self._delete_template)):
+            b = ttk.Button(buttons, text=text, command=lambda c=command: c(state))
+            b.pack(side="left", padx=(0, 6))
+            state.template_buttons[key] = b
+        ttk.Label(bar, textvariable=state.template_info, style="Help.Card.TLabel").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._update_template_ui(state)
+
+    def _update_template_ui(self, state: ModeState) -> None:
+        names = documents.template_names(state.key)
+        if state.template.get() not in names:
+            state.template.set(documents.DEFAULT_TEMPLATE)
+        name = state.template.get()
+        state.template_box.configure(values=names)
+        default = name == documents.DEFAULT_TEMPLATE
+        for key in ("rename", "delete"):
+            state.template_buttons[key].configure(state="disabled" if default else "normal")
+        file = f"{state.key}.yaml" if default else documents.templates_path(state.key).name
+        langs = ", ".join(documents.LANGUAGES[c] for c in documents.template_languages(state.key, name))
+        state.template_info.set(f"In data/{file}. Text in: {langs or 'no language yet'}")
+
+    def _ask_template_name(self, state: ModeState, title: str, initial: str = "",
+                           current: str | None = None) -> str | None:
+        name = initial
+        while True:
+            name = simpledialog.askstring(title, f"Name of the {state.label.lower()} template:",
+                                          initialvalue=name, parent=self)
+            if name is None:
+                return None
+            problem = documents.template_name_problem(state.key, name, current)
+            if not problem:
+                return name
+            messagebox.showwarning(title, problem, parent=self)
+
+    def _choose_template(self, state: ModeState) -> None:
+        """A template was picked in the dropdown: fill the boxes with it (asking before losing edits)."""
+        name, previous = state.template.get(), state.active_template
+        if name == previous:
+            return
+        if self._form(state) != state.loaded_defaults and not messagebox.askyesno(
+                "Use template", f"Replace the {state.label} text with the template '{name}'?\n"
+                                "The text in the boxes will be lost."):
+            state.template.set(previous)
+            return
+        self._fill_defaults(state)
+        self._mark_dirty(state)
+        self._update_template_ui(state)
+
+    def _save_template(self, state: ModeState) -> None:
+        name, lang = state.template.get(), documents.LANGUAGES[self.language]
+        file = (f"{state.key}.yaml" if name == documents.DEFAULT_TEMPLATE
+                else documents.templates_path(state.key).name)
+        if not messagebox.askyesno(
+                "Save template",
+                f"Overwrite the {lang} text of the template '{name}' (data/{file}) with the text in the boxes?\n\n"
+                f"The previous file is kept as {file}.bak. Comments in the file are not kept."):
+            return
+        form = self._form(state)
+        documents.save_template(state.key, name, self.language, form)
+        state.loaded_defaults = form
+        self._update_template_ui(state)
+        self._set_status(state, f"Saved the boxes as the {lang} text of the template '{name}'.")
+
+    def _new_template(self, state: ModeState) -> None:
+        name = self._ask_template_name(state, "New template")
+        if name is None:
+            return
+        form = self._form(state)
+        documents.save_template(state.key, name, self.language, form)
+        state.template.set(name)
+        state.active_template = name
+        state.loaded_defaults = form
+        self._update_template_ui(state)
+        self._set_status(state, f"Saved the boxes as the new template '{name}' "
+                                f"({documents.LANGUAGES[self.language]}).")
+
+    def _rename_template(self, state: ModeState) -> None:
+        old = state.template.get()
+        new = self._ask_template_name(state, "Rename template", old, current=old)
+        if new is None or new == old:
+            return
+        documents.rename_template(state.key, old, new)
+        state.template.set(new)
+        state.active_template = new
+        self._update_template_ui(state)
+        self._set_status(state, f"Renamed the template '{old}' to '{new}'.")
+
+    def _delete_template(self, state: ModeState) -> None:
+        name = state.template.get()
+        if not messagebox.askyesno("Delete template", f"Delete the {state.label.lower()} template '{name}' "
+                                                      "in all languages?\nThe text in the boxes is kept."):
+            return
+        documents.delete_template(state.key, name)
+        state.template.set(documents.DEFAULT_TEMPLATE)
+        state.active_template = documents.DEFAULT_TEMPLATE
+        state.loaded_defaults = {}          # the boxes no longer match a template: ask before replacing
+        self._update_template_ui(state)
+        self._set_status(state, f"Deleted the template '{name}'. The boxes keep its text.")
 
     def _text_box(self, parent, height: int, form_canvas: tk.Canvas) -> tuple[tk.Frame, tk.Text]:
         """A text box with its own scrollbar and a grip along the bottom edge to drag its height.
@@ -926,8 +1055,18 @@ class Editor(tk.Tk):
         return {key: self._get(state, key) for key, *_ in state.fields}
 
     def _fill_defaults(self, state: ModeState) -> None:
-        values = (cv_to_form(self.base_cv, self.track.get()) if state.key == "cv"
-                  else documents.load_defaults(state.key, self.language, self.personal))
+        """Fill the boxes with the CV text, or the chosen email/application template in the language."""
+        note = ""
+        if state.key == "cv":
+            values = cv_to_form(self.base_cv, self.track.get())
+        else:
+            name = state.template.get()
+            values = documents.load_template(state.key, name, self.language, self.personal)
+            if values is None:           # the template has no text in this language yet
+                values = documents.load_defaults(state.key, self.language, self.personal)
+                note = (f"The template '{name}' has no {documents.LANGUAGES[self.language]} text yet: "
+                        "the boxes have the Default text. 'Save template' stores them as its text.")
+            state.active_template = name
         row = self.model.find(self.company) if getattr(self, "company", None) else None
         if row is not None:                  # fill in what the company list knows
             if state.key == "application":
@@ -940,6 +1079,8 @@ class Editor(tk.Tk):
             self._set(state, key, values.get(key, ""))
         state.loaded_defaults = state.baseline = self._form(state)
         self._validate(state)
+        if note:
+            self._set_status(state, note)
 
     def _load_cv_track(self) -> None:
         state = self.modes["cv"]
@@ -952,11 +1093,8 @@ class Editor(tk.Tk):
             self._fill_defaults(state)
         self._mark_dirty(state)
 
-    def _source_name(self, state: ModeState) -> str:
-        return "cv.yaml" if state.key == "cv" else f"{state.key}.yaml"
-
     def _reload(self, state: ModeState) -> None:
-        source = self._source_name(state)
+        source = "cv.yaml" if state.key == "cv" else f"the template '{state.template.get()}'"
         if not messagebox.askyesno("Reload", f"Replace all {state.label} text with the content of {source}?"):
             return
         if state.key == "cv":
@@ -966,25 +1104,20 @@ class Editor(tk.Tk):
         self._mark_dirty(state)
 
     def _save_defaults(self, state: ModeState) -> None:
-        """Overwrite the default text in the YAML file with what is in the boxes."""
-        path = documents.DATA / self._source_name(state)
-        if state.key == "cv":
-            what = (f"the CV text in {path.name} (track '{self.track.get()}' for headline and title) "
-                    "and your name and contact details in personal.yaml")
-        else:
-            what = f"the {documents.LANGUAGES[self.language]} {state.label.lower()} text in {path.name}"
+        """CV: overwrite the text in cv.yaml / personal.yaml with what is in the boxes.
+        (Email and application save to their template: _save_template.)"""
+        path = documents.DATA / "cv.yaml"
+        what = (f"the CV text in {path.name} (track '{self.track.get()}' for headline and title) "
+                "and your name and contact details in personal.yaml")
         if not messagebox.askyesno(
                 "Save as default",
                 f"Overwrite {what} with the text in the boxes?\n\n"
                 f"The previous file is kept as {path.name}.bak. Comments in the file are not kept."):
             return
         form = self._form(state)
-        if state.key == "cv":
-            self.base_cv = form_to_cv(self.base_cv, self.track.get(), form)
-            build_cv.save_cv(self.base_cv)          # name/contact -> personal.yaml, the rest -> cv.yaml
-            self.personal = build_cv.load_personal()
-        else:
-            documents.save_defaults(state.key, self.language, form)
+        self.base_cv = form_to_cv(self.base_cv, self.track.get(), form)
+        build_cv.save_cv(self.base_cv)          # name/contact -> personal.yaml, the rest -> cv.yaml
+        self.personal = build_cv.load_personal()
         state.loaded_defaults = form
         self._set_status(state, f"Saved the boxes as default text in data/{path.name}")
 

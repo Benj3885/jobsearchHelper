@@ -57,6 +57,24 @@ def _unescape(text: str) -> str:
     return re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>])", r"\1", text)
 
 
+class LinkLabel(tk.Label):
+    """A web link shown as its full URL (never just "open"); a click opens it. Empty when there is no URL."""
+
+    def __init__(self, parent, colors, fonts, background: str | None = None) -> None:
+        family, size = fonts["small"][:2]
+        super().__init__(parent, anchor="w", justify="left", foreground=colors["accent"],
+                         background=background or colors["card"], font=(family, size, "underline"),
+                         borderwidth=0, padx=0, pady=0)
+        self.url = ""
+        self.bind("<Button-1>", lambda e: self.url and webbrowser.open(self.url))
+        # Wrap long URLs at the label's width.
+        self.bind("<Configure>", lambda e: self.configure(wraplength=max(e.width, 50)))
+
+    def set(self, url: str) -> None:
+        self.url = url.strip() if url.strip().startswith(("http://", "https://")) else ""
+        self.configure(text=self.url, cursor="hand2" if self.url else "")
+
+
 class MarkdownView(tk.Text):
     """Read-only Text that shows the subset of Markdown used in the docs: headings, paragraphs,
     **bold**, [links](url), bullets, task boxes, block quotes and tables."""
@@ -496,9 +514,9 @@ class PostingTextWindow(tk.Toplevel):
         head = ttk.Frame(self, style="Card.TFrame", padding=(16, 12))
         head.pack(fill="x")
         self.head_label = ttk.Label(head, style="Title.Card.TLabel")
-        self.head_label.pack(side="left")
-        self.link_btn = ttk.Button(head, text="Open link", padding=(8, 2), command=self._open_link)
-        self.link_btn.pack(side="right")
+        self.head_label.pack(fill="x")
+        self.link = LinkLabel(head, colors, fonts)
+        self.link.pack(fill="x", pady=(4, 0))
         ttk.Label(self, text="Paste the job posting here and save it, so you can still read it after the ad "
                              "is taken down.", foreground=colors["muted"], font=fonts["small"],
                   padding=(16, 8, 16, 4)).pack(fill="x")
@@ -540,7 +558,7 @@ class PostingTextWindow(tk.Toplevel):
         self.title(f"Job posting - {shown(self.posting)} - {shown(self.company)}")
         self.head_label.configure(text=f"{shown(self.posting)}   ·   {shown(self.company)}")
         _, posting = self._row_posting()
-        self.link_btn.configure(state="normal" if posting and posting["url"] else "disabled")
+        self.link.set(posting["url"] if posting else "")
 
     def _update_status(self) -> None:
         self.text.edit_modified(False)
@@ -566,11 +584,6 @@ class PostingTextWindow(tk.Toplevel):
         self.text.insert("insert", shown(clip))
         self.text.see("insert")
         return "break"
-
-    def _open_link(self) -> None:
-        _, posting = self._row_posting()
-        if posting and posting["url"]:
-            webbrowser.open(posting["url"])
 
     def modified(self) -> bool:
         return self.text.get("1.0", "end-1c") != self.saved_text
@@ -611,15 +624,23 @@ class CompaniesTab(ttk.Frame):
     quicklist. `on_open(company, posting)` makes it the company (and job posting, or None) being worked
     on in the Documents tab."""
 
-    COLUMNS = [("Company", 220), ("Fit", 70), ("Track", 120), ("Town", 130), ("Status", 110),
-               ("Last contact", 100), ("Quicklist", 80)]
+    COLUMNS = [("Company", 190), ("Fit", 55), ("Track", 105), ("Town", 105), ("Status", 100),
+               ("Last contact", 95), ("Quicklist", 75), ("Postings", 70), ("Earlier", 62)]
+    # These give up width first when the table is narrower than the columns (down to MIN_WIDTHS).
+    STRETCH = ("Company", "Track", "Town")
+    MIN_WIDTHS = {"Company": 100, "Track": 55, "Town": 55}
+    # Number columns: "Postings" = job postings being worked on (Job postings field), "Earlier" = entries
+    # in Past postings (companies.count_past_postings). 0 is shown empty; the first click sorts most first.
+    COUNT_COLUMNS = ("Postings", "Earlier")
     SORT_KEYS = {
+        "Postings": lambda v: int(v or 0),
+        "Earlier": lambda v: int(v or 0),
         "Fit": lambda v: {"High": 0, "Medium": 1, "Low": 2}.get(v, 3),
         "Status": lambda v: STATUSES.index(v) if v in STATUSES else len(STATUSES),
     }
     # Single-line fields in the detail panel, in order.
-    FIELDS = ["Fit", "Track", "Town", "What they do", "Contact person", "Email", "Homepage", "Source"]
-    LINK_FIELDS = ("Homepage", "Source")     # get an "Open" button
+    FIELDS = ["Fit", "Track", "Town", "What they do", "Contact person", "Email", "Homepage", "Found via"]
+    LINK_FIELDS = ("Homepage", "Found via")     # the full URL is shown below as a clickable link
 
     def __init__(self, parent, colors, fonts, model: companies.CompanyList, on_open=None) -> None:
         super().__init__(parent)
@@ -670,14 +691,18 @@ class CompaniesTab(ttk.Frame):
 
     # ---- left: table
     def _build_table(self, parent) -> tk.Frame:
-        border = tk.Frame(parent, background=self.colors["border"])
+        # A fixed size request, so the panes split the space by weight instead of growing with the
+        # column widths (which _fit_columns sets from the table's actual width).
+        border = tk.Frame(parent, background=self.colors["border"], width=820, height=300)
+        border.pack_propagate(False)
         inner = ttk.Frame(border, style="Card.TFrame")
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.tree = ttk.Treeview(inner, columns=[c for c, _ in self.COLUMNS], show="headings",
                                  selectmode="browse")
         for col, width in self.COLUMNS:
             self.tree.heading(col, text=col, anchor="w", command=lambda c=col: self._sort(c))
-            self.tree.column(col, width=width, minwidth=50, anchor="w", stretch=col in ("Company", "Track"))
+            self.tree.column(col, width=width, minwidth=self.MIN_WIDTHS.get(col, 50),
+                             anchor="center" if col in self.COUNT_COLUMNS else "w", stretch=col in self.STRETCH)
         for status, color in STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
         self.tree.tag_configure("interesting", font=self.fonts["bold"])
@@ -685,6 +710,7 @@ class CompaniesTab(ttk.Frame):
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        self.tree.bind("<Configure>", lambda e: self._fit_columns(e.width))
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
         self.tree.bind("<Button-1>", self._cell_click)
         self.tree.bind("<Double-1>", self._cell_double)
@@ -692,11 +718,20 @@ class CompaniesTab(ttk.Frame):
             self.tree.bind(seq, lambda e: self._end_cell_edit(), add="+")
         return border
 
+    def _fit_columns(self, width: int) -> None:
+        """Make the columns fill the table's width exactly: the STRETCH columns share what the fixed
+        ones leave, in proportion to their normal widths and never below MIN_WIDTHS."""
+        widths = dict(self.COLUMNS)
+        fixed = sum(w for c, w in widths.items() if c not in self.STRETCH)
+        base = sum(widths[c] for c in self.STRETCH)
+        free = max(width - fixed - 2, sum(self.MIN_WIDTHS.values()))
+        for c in self.STRETCH:
+            self.tree.column(c, width=max(self.MIN_WIDTHS[c], free * widths[c] // base))
+
     # ---- right: details of the selected company
     def _build_details(self, parent) -> tk.Frame:
         border = tk.Frame(parent, background=self.colors["border"])
-        d = ttk.Frame(border, style="Card.TFrame", padding=(16, 14))
-        d.pack(fill="both", expand=True, padx=1, pady=1)
+        d = ttk.Frame(border, style="Card.TFrame", padding=(16, 14))      # packed below, after the buttons
         d.columnconfigure(1, weight=1)
         head = ttk.Frame(d, style="Card.TFrame")
         head.grid(row=0, column=0, columnspan=3, sticky="ew")
@@ -712,6 +747,7 @@ class CompaniesTab(ttk.Frame):
         self.interest_box.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 4))
 
         self.entries: dict[str, ttk.Entry] = {}
+        self.links: dict[str, LinkLabel] = {}
         row = 2
         for field in self.FIELDS:
             ttk.Label(d, text=field, style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
@@ -726,47 +762,58 @@ class CompaniesTab(ttk.Frame):
             w.bind("<Return>", lambda e: self._commit())
             self.entries[field] = w
             if field in self.LINK_FIELDS:
-                ttk.Button(d, text="Open", padding=(8, 2), command=lambda f=field: self._open_link(f)).grid(
-                    row=row, column=2, sticky="w", pady=(6, 0), padx=(6, 0))
+                row += 1
+                link = LinkLabel(d, self.colors, self.fonts)
+                link.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(12, 0), pady=(2, 0))
+                self.links[field] = link
             row += 1
 
-        ttk.Label(d, text="Status", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(14, 0))
+        ttk.Label(d, text="Status", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        status_row = ttk.Frame(d, style="Card.TFrame")
+        status_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(12, 0), padx=(12, 0))
         self.d_status = tk.StringVar()
-        self.status_box = ttk.Combobox(d, textvariable=self.d_status, state="readonly", values=STATUSES, width=18)
-        self.status_box.grid(row=row, column=1, sticky="w", pady=(14, 0), padx=(12, 0))
+        self.status_box = ttk.Combobox(status_row, textvariable=self.d_status, state="readonly", values=STATUSES,
+                                       width=16)
+        self.status_box.pack(side="left")
         self.status_box.bind("<<ComboboxSelected>>", lambda e: self._status_changed())
-        row += 1
-
-        ttk.Label(d, text="Last contact", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
-        date_row = ttk.Frame(d, style="Card.TFrame")
-        date_row.grid(row=row, column=1, sticky="w", pady=(6, 0), padx=(12, 0))
-        self.d_date = ttk.Entry(date_row, width=14)
+        ttk.Label(status_row, text="Last contact", style="Field.Card.TLabel").pack(side="left", padx=(18, 8))
+        self.d_date = ttk.Entry(status_row, width=12)
         self.d_date.pack(side="left")
         self.d_date.bind("<FocusOut>", lambda e: self._commit())
         self.d_date.bind("<Return>", lambda e: self._commit())
-        self.today_btn = ttk.Button(date_row, text="Today", command=self._today)
+        self.today_btn = ttk.Button(status_row, text="Today", command=self._today)
         self.today_btn.pack(side="left", padx=(6, 0))
         row += 1
 
-        # Job postings: title, whether the posting text is saved, link
-        ttk.Label(d, text="Job postings", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w",
-                                                                         pady=(14, 0))
-        pbar = ttk.Frame(d, style="Card.TFrame")
-        pbar.grid(row=row, column=1, columnspan=2, sticky="e", pady=(14, 0))
-        self.posting_btns = {}
-        for key, text, command in (("add", "Add...", self._add_posting), ("edit", "Edit...", self._edit_posting),
-                                   ("remove", "Remove", self._remove_posting),
-                                   ("text", "Posting text", self._posting_text)):
-            b = ttk.Button(pbar, text=text, padding=(8, 2), command=command)
-            b.pack(side="left", padx=(4, 0))
-            self.posting_btns[key] = b
+        # Job postings, Notes and Past postings share one area (tabs), which gets all the height that is left.
+        self.text_tabs = ttk.Notebook(d)
+        self.text_tabs.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
+        d.rowconfigure(row, weight=1, minsize=160)
         row += 1
-        pborder = tk.Frame(d, background=self.colors["border"])
-        pborder.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+
+        # Job postings: title, whether the posting text is saved, link
+        page = ttk.Frame(self.text_tabs, style="Card.TFrame", padding=(0, 6, 0, 0))
+        self.text_tabs.add(page, text="Job postings")
+        pbar = ttk.Frame(page, style="Card.TFrame")
+        pbar.pack(fill="x")
+        ttk.Label(pbar, text="Double-click a posting to read or paste the ad's text.", style="Help.Card.TLabel"
+                  ).pack(side="left")
+        self.posting_btns = {}
+        for key, text, command in (("text", "Posting text", self._posting_text),
+                                   ("remove", "Remove", self._remove_posting), ("edit", "Edit...", self._edit_posting),
+                                   ("add", "Add...", self._add_posting)):
+            b = ttk.Button(pbar, text=text, padding=(8, 2), command=command)
+            b.pack(side="right", padx=(4, 0))
+            self.posting_btns[key] = b
+        # The table cuts long URLs off, so the selected posting's full link is shown below it too.
+        self.p_link = LinkLabel(page, self.colors, self.fonts)
+        self.p_link.pack(side="bottom", fill="x", pady=(4, 0))
+        pborder = tk.Frame(page, background=self.colors["border"])
+        pborder.pack(fill="both", expand=True, pady=(4, 0))
         self.p_tree = ttk.Treeview(pborder, columns=("title", "text", "link"), show="headings", height=3,
                                    selectmode="browse")
         for col, text, width, stretch in (("title", "Posting", 220, True), ("text", "Posting text", 110, False),
-                                          ("link", "Link", 60, False)):
+                                          ("link", "Link", 320, True)):
             self.p_tree.heading(col, text=text, anchor="w")
             self.p_tree.column(col, width=width, minwidth=40, anchor="w", stretch=stretch)
         self.p_tree.tag_configure("saved", foreground=GOOD)
@@ -775,31 +822,17 @@ class CompaniesTab(ttk.Frame):
         self.p_tree.bind("<<TreeviewSelect>>", lambda e: self._posting_buttons())
         self.p_tree.bind("<Double-1>", lambda e: self.p_tree.identify_row(e.y) and self._posting_text())
         self.p_tree.bind("<Button-1>", self._posting_click)
-        row += 1
-        ttk.Label(d, text="Double-click a posting to read or paste the ad's text.", style="Help.Card.TLabel"
-                  ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        row += 1
 
-        ttk.Label(d, text="Notes", style="Field.Card.TLabel").grid(row=row, column=0, sticky="nw", pady=(14, 0))
-        row += 1
-        box = tk.Frame(d, background="#FFFFFF", highlightthickness=1,
-                       highlightbackground=self.colors["border"], highlightcolor=self.colors["border"])
-        box.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        d.rowconfigure(row, weight=1)
-        row += 1
-        self.d_notes = tk.Text(box, wrap="word", undo=True, font=self.fonts["body"], height=6, padx=8, pady=6,
-                               relief="flat", borderwidth=0, highlightthickness=0, background="#FFFFFF",
-                               foreground=self.colors["ink"], insertbackground=self.colors["ink"])
-        nscroll = ttk.Scrollbar(box, orient="vertical", command=self.d_notes.yview)
-        self.d_notes.configure(yscrollcommand=nscroll.set)
-        self.d_notes.pack(side="left", fill="both", expand=True)
-        nscroll.pack(side="right", fill="y")
-        self.d_notes.bind("<FocusIn>", lambda e: box.configure(highlightbackground=self.colors["accent"]))
-        self.d_notes.bind("<FocusOut>", lambda e: (box.configure(highlightbackground=self.colors["border"]),
-                                                   self._commit()))
+        self.d_notes = self._text_field(self.text_tabs, "Notes")
+        self.d_past = self._text_field(
+            self.text_tabs, "Past postings",
+            "Earlier ads (closed too), one per line: title, when, what they asked for. "
+            "Lines starting with 'Note:' are not counted.")
+        self.d_past.bind("<KeyRelease>", lambda e: self._past_tab_label(), add="+")
 
-        bottom = ttk.Frame(d, style="Card.TFrame")
-        bottom.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        # Packed before the panel's content, so a too-small window cuts the text area, not the buttons.
+        bottom = ttk.Frame(border, style="Card.TFrame", padding=(16, 8, 16, 12))
+        bottom.pack(side="bottom", fill="x", padx=1, pady=(0, 1))
         self.open_btn = ttk.Button(bottom, text="Work on it in Documents", style="Accent.TButton",
                                    command=self._open)
         self.open_btn.pack(side="left")
@@ -807,6 +840,7 @@ class CompaniesTab(ttk.Frame):
         self.delete_btn.pack(side="left", padx=(6, 0))
         self.saved = ttk.Label(bottom, style="Status.Card.TLabel")
         self.saved.pack(side="right")
+        d.pack(fill="both", expand=True, padx=1, pady=(1, 0))
         self._show_details(None)
         return border
 
@@ -842,6 +876,10 @@ class CompaniesTab(ttk.Frame):
         for c, _ in self.COLUMNS:
             if c == "Quicklist":
                 values.append("[x]" if companies.is_interesting(r) else "[  ]")
+            elif c == "Postings":
+                values.append(str(len(self.model.postings(r)) or ""))
+            elif c == "Earlier":
+                values.append(str(companies.count_past_postings(r) or ""))
             else:
                 values.append(shown(r.get(c, "")))
         return values
@@ -854,7 +892,8 @@ class CompaniesTab(ttk.Frame):
             return False
         q = self.search.get().strip().lower()
         return not q or any(q in (r.get(c) or "").lower()
-                            for c in ("Company", "Town", "Track", "What they do", "Notes", "Contact person", "Job postings"))
+                            for c in ("Company", "Town", "Track", "What they do", "Notes", "Past postings", "Contact person",
+                                      "Job postings"))
 
     def _fill_tree(self) -> None:
         self._end_cell_edit()
@@ -982,7 +1021,8 @@ class CompaniesTab(ttk.Frame):
                                     + "  ·  ".join(parts))
 
     def _sort(self, column: str) -> None:
-        self.sort_reverse = not self.sort_reverse if self.sort_column == column else False
+        self.sort_reverse = (not self.sort_reverse if self.sort_column == column
+                             else column in self.COUNT_COLUMNS)
         self.sort_column = column
         for col, _ in self.COLUMNS:
             arrow = (" ▼" if self.sort_reverse else " ▲") if col == column else ""
@@ -1023,6 +1063,7 @@ class CompaniesTab(ttk.Frame):
             w.delete(0, "end")
             w.insert(0, r.get(field, "") if r else "")
             w.configure(state=state)
+        self._update_links()
         self.d_status.set(r["Status"] if r else "")
         values = STATUSES + ([r["Status"]] if r and r["Status"] and r["Status"] not in STATUSES else [])
         self.status_box.configure(values=values, state="readonly" if r else "disabled")
@@ -1030,15 +1071,43 @@ class CompaniesTab(ttk.Frame):
         self.d_date.delete(0, "end")
         self.d_date.insert(0, r["Last contact"] if r else "")
         self.d_date.configure(state=state)
-        self.d_notes.configure(state="normal")
-        self.d_notes.delete("1.0", "end")
-        self.d_notes.insert("1.0", r["Notes"] if r else "")
-        self.d_notes.edit_reset()
-        self.d_notes.configure(state=state)
+        for box, field in ((self.d_notes, "Notes"), (self.d_past, "Past postings")):
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", r.get(field, "") if r else "")
+            box.edit_reset()
+            box.configure(state=state)
+        self._past_tab_label()
         for b in (self.rename_btn, self.interest_box, self.today_btn, self.delete_btn):
             b.configure(state=state)
         self.open_btn.configure(state=state if self.on_open else "disabled")
         self._fill_postings()
+
+    def _text_field(self, tabs: ttk.Notebook, label: str, help_text: str = "") -> tk.Text:
+        """A tab with a multi-line text box, saved when it loses focus."""
+        page = ttk.Frame(tabs, style="Card.TFrame", padding=(0, 6, 0, 0))
+        tabs.add(page, text=label)
+        if help_text:
+            ttk.Label(page, text=help_text, style="Help.Card.TLabel").pack(anchor="w", pady=(0, 4))
+        box = tk.Frame(page, background="#FFFFFF", highlightthickness=1,
+                       highlightbackground=self.colors["border"], highlightcolor=self.colors["border"])
+        box.pack(fill="both", expand=True)
+        text = tk.Text(box, wrap="word", undo=True, font=self.fonts["body"], height=4, padx=8, pady=6,
+                       relief="flat", borderwidth=0, highlightthickness=0, background="#FFFFFF",
+                       foreground=self.colors["ink"], insertbackground=self.colors["ink"])
+        scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        text.bind("<FocusIn>", lambda e: box.configure(highlightbackground=self.colors["accent"]))
+        text.bind("<FocusOut>", lambda e: (box.configure(highlightbackground=self.colors["border"]),
+                                           self._commit()))
+        return text
+
+    def _past_tab_label(self) -> None:
+        """'Past postings (n)' on the tab, counted from what is in the box now."""
+        n = companies.count_past_postings({"Past postings": self.d_past.get("1.0", "end-1c")})
+        self.text_tabs.tab(2, text=f"Past postings ({n})" if n else "Past postings")
 
     # ---- job postings of the company in the panel
     def _selected_posting(self) -> dict[str, str] | None:
@@ -1057,20 +1126,23 @@ class CompaniesTab(ttk.Frame):
             has = companies.has_posting_text(r["Company"], p["title"])
             self.p_tree.insert("", "end", iid=str(i), tags=("saved" if has else "missing",),
                                values=(shown(p["title"]), "saved" if has else "not created",
-                                       "open" if p["url"] else ""))
+                                       p["url"]))
             if p["title"] == select:
                 self.p_tree.selection_set(str(i))
+        n = len(self.model.postings(r))
+        self.text_tabs.tab(0, text=f"Job postings ({n})" if n else "Job postings")
         self._posting_buttons()
 
     def _posting_buttons(self) -> None:
         p = self._selected_posting()
+        self.p_link.set(p["url"] if p else "")
         self.posting_btns["add"].configure(state="normal" if self._row() else "disabled")
         for key in ("edit", "remove", "text"):
             self.posting_btns[key].configure(state="normal" if p else "disabled")
         self.open_btn.configure(text="Work on this posting in Documents" if p else "Work on it in Documents")
 
     def _posting_click(self, e) -> None:
-        """A click on 'open' in the Link column opens the posting's web page."""
+        """A click on the URL in the Link column opens the posting's web page."""
         iid = self.p_tree.identify_row(e.y)
         if iid and self.p_tree.identify_column(e.x) == "#3":
             postings = self.model.postings(self._row())
@@ -1088,6 +1160,7 @@ class CompaniesTab(ttk.Frame):
         self.model.add_posting(r, *value)
         self._save()
         self._fill_postings(select=value[0])
+        self._update_row()
 
     def _edit_posting(self) -> None:
         r, p = self._row(), self._selected_posting()
@@ -1104,6 +1177,7 @@ class CompaniesTab(ttk.Frame):
         PostingTextWindow.renamed(r["Company"], r["Company"], p["title"], value[0])
         self._save()
         self._fill_postings(select=value[0])
+        self._update_row()
 
     def _remove_posting(self) -> None:
         r, p = self._row(), self._selected_posting()
@@ -1119,6 +1193,7 @@ class CompaniesTab(ttk.Frame):
         self.model.remove_posting(r, p["title"])
         self._save()
         self._fill_postings()
+        self._update_row()
 
     def _posting_text(self) -> None:
         r, p = self._row(), self._selected_posting()
@@ -1136,9 +1211,11 @@ class CompaniesTab(ttk.Frame):
         new = {field: w.get().strip() for field, w in self.entries.items()}
         new["Last contact"] = self.d_date.get().strip()
         new["Notes"] = self.d_notes.get("1.0", "end-1c").strip()
+        new["Past postings"] = self.d_past.get("1.0", "end-1c").strip()
         if all(r.get(k, "") == v for k, v in new.items()):
             return False
         r.update(new)
+        self._update_links()
         self._update_row()
         if save:
             self._save()
@@ -1169,10 +1246,9 @@ class CompaniesTab(ttk.Frame):
         self.d_date.insert(0, datetime.date.today().isoformat())
         self._commit()
 
-    def _open_link(self, field: str) -> None:
-        url = self.entries[field].get().strip()
-        if url.startswith(("http://", "https://")):
-            webbrowser.open(url)
+    def _update_links(self) -> None:
+        for field, link in self.links.items():
+            link.set(self.entries[field].get())
 
     def _open(self) -> None:
         r = self._row()

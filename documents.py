@@ -35,7 +35,10 @@ def load_defaults(kind: str, lang: str, personal: dict[str, str] | None = None,
     $name, $short_name, $phone, $email and $location are filled in from data/personal.yaml."""
     path = build_cv.data_file(DATA / f"{kind}.yaml", DATA / f"{kind}.example.yaml", example)
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    values = data.get(lang) or {}
+    return _fill_personal(data.get(lang) or {}, personal)
+
+
+def _fill_personal(values: dict, personal: dict[str, str] | None) -> dict[str, str]:
     personal = personal or build_cv.load_personal()
     subst = {k: personal[k] for k in PERSONAL_VARS}
     return {k: string.Template("" if v is None else str(v)).safe_substitute(subst).rstrip("\n")
@@ -58,14 +61,98 @@ def save_defaults(kind: str, lang: str, values: dict[str, str]) -> Path:
     path = DATA / f"{kind}.yaml"
     source = build_cv.data_file(path, DATA / f"{kind}.example.yaml")   # the other language starts from here
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
-    personal = build_cv.load_personal()
-    values = {k: to_variables(v, personal) for k, v in values.items()}
-    data[lang] = {k: (v.rstrip() + "\n" if "\n" in v else v) for k, v in values.items()}
+    data[lang] = _for_yaml(values)
     header = (f"# Default text for a new {kind} in the editor, per language (da = Danish, en = English).\n"
               "# NOT in git (see .gitignore). $name, $short_name, $phone, $email, $location are filled in\n"
               "# from data/personal.yaml.\n"
-              "# Written by the editor's 'Save as default' button; the previous version is in the .bak file.\n\n")
+              "# Written by the editor's template 'Save' button; the previous version is in the .bak file.\n\n")
     return write_yaml(path, data, header)
+
+
+def _for_yaml(values: dict[str, str]) -> dict[str, str]:
+    """Personal details back to $variables; multi-line text ends with a newline (YAML block style)."""
+    personal = build_cv.load_personal()
+    values = {k: to_variables(v, personal) for k, v in values.items()}
+    return {k: (v.rstrip() + "\n" if "\n" in v else v) for k, v in values.items()}
+
+
+# --------------------------------------------------------------------------- named templates
+# Besides the default text above ("Default"), an email or application can start from a named template.
+# They live in data/<kind>_templates.yaml (git-ignored): {name: {da: {...}, en: {...}}}.
+# A template may exist in one language only.
+
+DEFAULT_TEMPLATE = "Default"
+
+
+def templates_path(kind: str) -> Path:
+    return DATA / f"{kind}_templates.yaml"
+
+
+def _read_templates(kind: str) -> dict[str, dict]:
+    path = templates_path(kind)
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _write_templates(kind: str, data: dict[str, dict]) -> Path:
+    header = (f"# Named templates for a new {kind} in the editor: name -> language (da/en) -> boxes.\n"
+              "# NOT in git (see .gitignore). $name, $short_name, $phone, $email, $location are filled in\n"
+              "# from data/personal.yaml. Written by the editor; the previous version is in the .bak file.\n\n")
+    return write_yaml(templates_path(kind), data, header)
+
+
+def template_names(kind: str) -> list[str]:
+    """'Default' first, then the named templates alphabetically."""
+    return [DEFAULT_TEMPLATE] + sorted(_read_templates(kind), key=str.casefold)
+
+
+def template_languages(kind: str, name: str) -> list[str]:
+    if name == DEFAULT_TEMPLATE:
+        return list(LANGUAGES)
+    return [lang for lang in LANGUAGES if (_read_templates(kind).get(name) or {}).get(lang)]
+
+
+def load_template(kind: str, name: str, lang: str,
+                  personal: dict[str, str] | None = None) -> dict[str, str] | None:
+    """Box contents of a template in a language, or None if it has no text in that language."""
+    if name == DEFAULT_TEMPLATE:
+        return load_defaults(kind, lang, personal)
+    values = (_read_templates(kind).get(name) or {}).get(lang)
+    return _fill_personal(values, personal) if isinstance(values, dict) else None
+
+
+def template_name_problem(kind: str, name: str, current: str | None = None) -> str:
+    """Why `name` can't be used for a new/renamed template ('' if it can)."""
+    if not name.strip():
+        return "Enter a name."
+    if name != name.strip():
+        return "The name can't start or end with a space."
+    taken = {n.casefold() for n in template_names(kind) if n != current}
+    if name.casefold() in taken:
+        return f"There is already a template called '{name}'."
+    return ""
+
+
+def save_template(kind: str, name: str, lang: str, values: dict[str, str]) -> Path:
+    """Save `values` as the `lang` text of template `name` (created if new)."""
+    if name == DEFAULT_TEMPLATE:
+        return save_defaults(kind, lang, values)
+    data = _read_templates(kind)
+    data.setdefault(name, {})[lang] = _for_yaml(values)
+    return _write_templates(kind, data)
+
+
+def rename_template(kind: str, old: str, new: str) -> Path:
+    data = _read_templates(kind)
+    return _write_templates(kind, {(new if k == old else k): v for k, v in data.items()})
+
+
+def delete_template(kind: str, name: str) -> Path:
+    data = _read_templates(kind)
+    data.pop(name, None)
+    return _write_templates(kind, data)
 
 
 # --------------------------------------------------------------------------- import

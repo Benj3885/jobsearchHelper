@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime
+import re
 import webbrowser
 import tkinter as tk
 from tkinter import ttk
@@ -84,13 +85,13 @@ class Quicklist(ttk.Frame):
 
         actions = ttk.Frame(self, style="Card.TFrame")
         actions.pack(fill="x", pady=(8, 0))
-        self.applied_btn = ttk.Button(actions, text="Mark applied", padding=(8, 3), command=self._mark_applied)
+        self.applied_btn = ttk.Button(actions, text="Mark applied", width=0, padding=(6, 3), command=self._mark_applied)
         self.applied_btn.pack(side="left")
-        self.undo_btn = ttk.Menubutton(actions, text="Undo applied", padding=(8, 3))
+        self.undo_btn = ttk.Menubutton(actions, text="Undo applied", padding=(6, 3))
         self.undo_menu = tk.Menu(self.undo_btn, tearoff=False, font=fonts["body"])
         self.undo_btn.configure(menu=self.undo_menu)
         self.undo_btn.pack(side="left", padx=(4, 0))
-        self.edit_btn = ttk.Button(actions, text="Edit...", padding=(8, 3),
+        self.edit_btn = ttk.Button(actions, text="Edit...", width=0, padding=(6, 3),
                                    command=lambda: self.active and self.on_edit(self.active))
         self.edit_btn.pack(side="right")
 
@@ -104,6 +105,8 @@ class Quicklist(ttk.Frame):
         self.info.tag_bind("link", "<Enter>", lambda e: self.info.configure(cursor="hand2"))
         self.info.tag_bind("link", "<Leave>", lambda e: self.info.configure(cursor="arrow"))
         self.info.tag_bind("email", "<Button-1>", lambda e: self._copy_email())
+        self.info.tag_bind("past-toggle", "<Button-1>", lambda e: self._toggle_past())
+        self.show_past = False      # "Past postings" in the details: collapsed until clicked
         self.refresh()
 
     # ---- dropdown
@@ -230,16 +233,44 @@ class Quicklist(ttk.Frame):
         line("Status", r["Status"] + (f" (last contact {r['Last contact']})" if r["Last contact"] else ""))
         posting = next((p for p in self.model.postings(r) if p["title"] == self.posting), None)
         links = [("Posting", posting["url"] if posting else ""), ("Homepage", r.get("Homepage", "")),
-                 ("Source", r.get("Source", ""))]
+                 ("Found via", r.get("Found via", ""))]
         for label, url in links:
             if url.startswith(("http://", "https://")):
                 t.insert("end", f"{label}: ", ("label",))
-                t.insert("end", "open link", ("link", f"url-{label}"))
+                t.insert("end", url, ("link", f"url-{label}"))
                 t.insert("end", "\n")
                 t.tag_bind(f"url-{label}", "<Button-1>", lambda e, u=url: webbrowser.open(u))
         t.insert("end", "Notes: ", ("label",))
         t.insert("end", shown(r["Notes"]) if r["Notes"] else "-", () if r["Notes"] else ("label",))
-        t.configure(state="disabled", height=min(11, max(4, int(t.count("1.0", "end", "displaylines")[0]))))
+        past = [p for p in r.get("Past postings", "").splitlines() if p.strip()]
+        t.insert("end", "\nPast postings: ", ("label",))
+        if not past:
+            t.insert("end", "-", ("label",))
+        else:
+            count = companies.count_past_postings(r)
+            t.insert("end", "hide" if self.show_past else f"show ({count})" if count else "show",
+                     ("link", "past-toggle"))
+            if self.show_past:
+                for i, p in enumerate(past):
+                    t.insert("end", "\n- ")
+                    self._insert_with_links(t, shown(p.strip()), f"past-{i}")
+        cap = 30 if self.show_past and past else 16
+        t.configure(state="disabled", height=min(cap, max(4, int(t.count("1.0", "end", "displaylines")[0]))))
+
+    def _toggle_past(self) -> None:
+        self.show_past = not self.show_past
+        self._show_info()
+
+    @staticmethod
+    def _insert_with_links(t: tk.Text, text: str, tag_prefix: str) -> None:
+        """Insert text with every http(s) URL in it shown as a clickable link (the full URL)."""
+        for j, part in enumerate(re.split(r"(https?://\S+)", text)):
+            if part.startswith(("http://", "https://")):
+                tag = f"{tag_prefix}-{j}"
+                t.insert("end", part, ("link", tag))
+                t.tag_bind(tag, "<Button-1>", lambda e, u=part: webbrowser.open(u))
+            elif part:
+                t.insert("end", part)
 
     def _copy_email(self) -> None:
         r = self.model.find(self.active)
