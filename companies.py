@@ -37,8 +37,15 @@ FITS = ["High", "Medium", "Low"]
 
 # Columns the program uses. Missing ones are added (empty) when the file is read; other columns are kept.
 COLUMNS = ["Company", "Fit", "Track", "Town", "What they do", "Status", "Last contact", "Contact person",
-           "Email", "Notes", "Past postings", "Found via", "Homepage", "Job postings", "Interesting", "Previous status",
+           "Email", "Notes", "Past postings", "Found via", "Homepage", "Unsolicited form", "Job postings", "Interesting", "Previous status",
            "Previous last contact", "Status changed"]
+
+
+
+def has_unsolicited_form(row: dict[str, str]) -> bool:
+    """The company has a link to a form for unsolicited applications ('Unsolicited form' filled in)."""
+    return bool(row.get("Unsolicited form", "").strip())
+
 
 # Document type -> (file name suffix, extension). Same as the editor's MODES.
 DOC_TYPES = {"email": ("_EMAIL", ".txt"), "application": ("_APPLICATION", ".pdf"), "cv": ("_CV", ".pdf")}

@@ -25,14 +25,17 @@ from __future__ import annotations
 import copy
 import json
 import re
+import os
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
+import appearance
 import build_cv
 import companies
 import documents
@@ -218,19 +221,8 @@ def form_to_cv(base: dict, track: str, f: dict[str, str]) -> dict:
 
 # --------------------------------------------------------------------------- look & feel
 
-COLORS = {
-    "bg": "#EEF1F5",          # window background
-    "card": "#FFFFFF",        # panels
-    "border": "#D5DCE5",
-    "ink": "#1E2530",
-    "muted": "#6B7686",
-    "accent": "#1F5FA8",
-    "accent_hover": "#174C87",
-    "hover": "#F1F4F8",
-    "preview_bg": "#E3E7ED",
-    "page_shadow": "#C3CAD4",
-    "error": "#C62828",
-}
+COLORS = appearance.COLORS     # light or dark palette (appearance.py)
+px = appearance.px
 # First installed family wins. Tk builds without Xft only see X11 core fonts.
 FONT_CANDIDATES = ["Inter", "Lato", "Ubuntu", "Noto Sans", "DejaVu Sans", "nimbus sans l", "helvetica"]
 
@@ -238,18 +230,31 @@ FONT_CANDIDATES = ["Inter", "Lato", "Ubuntu", "Noto Sans", "DejaVu Sans", "nimbu
 def setup_style(root: tk.Tk) -> dict[str, tuple]:
     import tkinter.font as tkfont
 
+    appearance.PX_PER_PT = float(root.tk.call("tk", "scaling"))      # font sizes: appearance.pt()
+    pt = appearance.pt
     families = {f.lower(): f for f in tkfont.families(root)}
     family = next((families[c.lower()] for c in FONT_CANDIDATES if c.lower() in families), "TkDefaultFont")
     fonts = {
-        "body": (family, 10),
-        "small": (family, 9),
-        "bold": (family, 10, "bold"),
-        "title": (family, 13, "bold"),
+        "body": (family, pt(10)),
+        "small": (family, pt(9)),
+        "bold": (family, pt(10), "bold"),
+        "title": (family, pt(13), "bold"),
     }
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-        tkfont.nametofont(name).configure(family=family, size=10)
+        tkfont.nametofont(name).configure(family=family, size=pt(10))
+    for name, size in (("TkCaptionFont", 12), ("TkSmallCaptionFont", 9), ("TkTooltipFont", 9),
+                       ("TkIconFont", 10), ("TkFixedFont", 10)):       # dialogs etc. follow the UI size too
+        tkfont.nametofont(name).configure(size=pt(size))
 
     c = COLORS
+    # Classic Tk widgets, menus and dialogs (messagebox, simpledialog) take their colours from this.
+    root.tk_setPalette(background=c["bg"], foreground=c["ink"], activeBackground=c["hover"],
+                       activeForeground=c["ink"], selectBackground=c["accent"], selectForeground=c["on_accent"],
+                       highlightColor=c["accent"], highlightBackground=c["bg"], insertBackground=c["ink"],
+                       troughColor=c["bg"], disabledForeground=c["disabled"])
+    root.option_add("*Entry.background", c["field"])
+    root.option_add("*Text.background", c["field"])
+    root.option_add("*Listbox.background", c["field"])
     root.configure(background=c["bg"])
     s = ttk.Style(root)
     s.theme_use("clam")
@@ -266,55 +271,64 @@ def setup_style(root: tk.Tk) -> dict[str, tuple]:
     s.configure("Status.Card.TLabel", background=c["card"], foreground=c["muted"], font=fonts["small"])
 
     # Buttons: filled accent for the main action, outlined for the rest.
-    s.configure("Accent.TButton", background=c["accent"], foreground="#FFFFFF", font=fonts["bold"],
-                borderwidth=0, padding=(18, 7), lightcolor=c["accent"], darkcolor=c["accent"])
+    s.configure("Accent.TButton", background=c["accent"], foreground=c["on_accent"], font=fonts["bold"],
+                borderwidth=0, padding=(px(18), px(7)), lightcolor=c["accent"], darkcolor=c["accent"])
     s.map("Accent.TButton",
-          background=[("disabled", "#9DB3CF"), ("pressed", c["accent_hover"]), ("active", c["accent_hover"])],
+          background=[("disabled", c["accent_disabled"]), ("pressed", c["accent_hover"]), ("active", c["accent_hover"])],
           lightcolor=[("active", c["accent_hover"])], darkcolor=[("active", c["accent_hover"])])
-    s.configure("TButton", background=c["card"], foreground=c["ink"], padding=(16, 6), borderwidth=1,
+    s.configure("TButton", background=c["card"], foreground=c["ink"], padding=(px(16), px(6)), borderwidth=1,
                 bordercolor=c["border"], lightcolor=c["card"], darkcolor=c["card"])
     s.map("TButton",
           background=[("disabled", c["card"]), ("pressed", c["hover"]), ("active", c["hover"])],
-          foreground=[("disabled", "#A9B2BE")],
+          foreground=[("disabled", c["disabled"])],
           bordercolor=[("active", c["accent"])])
 
-    s.configure("TEntry", fieldbackground="#FFFFFF", padding=(8, 5), insertcolor=c["ink"])
+    s.configure("TEntry", fieldbackground=c["field"], padding=(px(8), px(5)), insertcolor=c["ink"])
     s.map("TEntry", bordercolor=[("focus", c["accent"])], lightcolor=[("focus", c["accent"])])
-    s.configure("TCombobox", fieldbackground="#FFFFFF", background=c["card"], padding=(8, 4), arrowcolor=c["muted"])
-    s.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")], bordercolor=[("focus", c["accent"])],
-          selectbackground=[("readonly", "#FFFFFF")], selectforeground=[("readonly", c["ink"])])
+    s.configure("TCombobox", fieldbackground=c["field"], background=c["card"], padding=(px(8), px(4)), arrowcolor=c["muted"])
+    s.map("TCombobox", fieldbackground=[("readonly", c["field"])], bordercolor=[("focus", c["accent"])],
+          selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["ink"])])
     root.option_add("*TCombobox*Listbox.font", fonts["body"])
     root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+    root.option_add("*TCombobox*Listbox.background", c["field"])
+    root.option_add("*TCombobox*Listbox.foreground", c["ink"])
 
-    s.configure("Vertical.TScrollbar", background="#C9D0DA", troughcolor=c["card"], bordercolor=c["card"],
-                lightcolor="#C9D0DA", darkcolor="#C9D0DA", arrowsize=0, gripcount=0)
-    s.map("Vertical.TScrollbar", background=[("active", "#AEB7C4")])
+    s.configure("Vertical.TScrollbar", background=c["scroll"], troughcolor=c["card"], bordercolor=c["card"],
+                lightcolor=c["scroll"], darkcolor=c["scroll"], arrowsize=0, gripcount=0)
+    s.map("Vertical.TScrollbar", background=[("active", c["scroll_active"])])
     s.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
         ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
     s.configure("TPanedwindow", background=c["bg"])
-    s.configure("Sash", sashthickness=10, gripcount=0, background=c["bg"], lightcolor=c["bg"], darkcolor=c["bg"])
+    s.configure("Sash", sashthickness=px(10), gripcount=0, background=c["bg"], lightcolor=c["bg"], darkcolor=c["bg"])
     # Segmented control (document type): outlined when off, filled when on.
     s.configure("Segment.TButton", background=c["card"], foreground=c["muted"], font=fonts["bold"],
-                padding=(6, 7), borderwidth=1, bordercolor=c["border"], lightcolor=c["card"], darkcolor=c["card"])
+                padding=(px(6), px(7)), borderwidth=1, bordercolor=c["border"], lightcolor=c["card"], darkcolor=c["card"])
     s.map("Segment.TButton", background=[("active", c["hover"])], foreground=[("active", c["ink"])])
-    s.configure("SegmentOn.TButton", background=c["accent"], foreground="#FFFFFF", font=fonts["bold"],
-                padding=(6, 7), borderwidth=1, bordercolor=c["accent"], lightcolor=c["accent"], darkcolor=c["accent"])
+    s.configure("SegmentOn.TButton", background=c["accent"], foreground=c["on_accent"], font=fonts["bold"],
+                padding=(px(6), px(7)), borderwidth=1, bordercolor=c["accent"], lightcolor=c["accent"], darkcolor=c["accent"])
     s.map("SegmentOn.TButton", background=[("active", c["accent_hover"])])
     # Top-level tabs (Documents / Job plan / Companies).
     s.configure("TNotebook", background=c["bg"], borderwidth=0, bordercolor=c["border"],
                 lightcolor=c["bg"], darkcolor=c["bg"], tabmargins=(0, 0, 0, 0))
     s.configure("TNotebook.Tab", background=c["bg"], foreground=c["muted"], font=fonts["bold"],
-                padding=(20, 8), borderwidth=0, bordercolor=c["border"], lightcolor=c["bg"])
+                padding=(px(20), px(8)), borderwidth=0, bordercolor=c["border"], lightcolor=c["bg"])
     s.map("TNotebook.Tab", background=[("selected", c["card"]), ("active", c["hover"])],
           foreground=[("selected", c["accent"]), ("active", c["ink"])],
           lightcolor=[("selected", c["accent"])], padding=[("selected", (20, 8))])
+    s.configure("TMenubutton", background=c["card"], foreground=c["ink"], bordercolor=c["border"],
+                lightcolor=c["card"], darkcolor=c["card"], arrowcolor=c["muted"])
+    s.map("TMenubutton", background=[("disabled", c["card"]), ("active", c["hover"])],
+          foreground=[("disabled", c["disabled"])], arrowcolor=[("disabled", c["disabled"])])
+    s.configure("TCheckbutton", indicatorbackground=c["field"], indicatorforeground=c["ink"],
+                upperbordercolor=c["border"], lowerbordercolor=c["border"])
+    s.map("TCheckbutton", indicatorbackground=[("pressed", c["hover"]), ("selected", c["field"])])
     s.configure("Required.Card.TLabel", background=c["card"], foreground=c["error"], font=fonts["bold"])
     s.configure("Error.Card.TLabel", background=c["card"], foreground=c["error"], font=fonts["small"])
-    s.configure("Invalid.TEntry", fieldbackground="#FFFFFF", padding=(8, 5), bordercolor=c["error"],
+    s.configure("Invalid.TEntry", fieldbackground=c["field"], padding=(px(8), px(5)), bordercolor=c["error"],
                 lightcolor=c["error"], darkcolor=c["error"])
-    s.configure("Blocked.TButton", background=c["card"], foreground=c["error"], padding=(16, 6), borderwidth=1,
+    s.configure("Blocked.TButton", background=c["card"], foreground=c["error"], padding=(px(16), px(6)), borderwidth=1,
                 bordercolor=c["error"], lightcolor=c["card"], darkcolor=c["card"])
-    s.map("Blocked.TButton", background=[("active", "#FDF1F1")])
+    s.map("Blocked.TButton", background=[("active", c["error_hover"])])
     return fonts
 
 
@@ -376,9 +390,11 @@ class Editor(tk.Tk):
         super().__init__()
         remove_previews()          # left over if the editor crashed last time
         self.title("Job search editor")
-        self.geometry("1560x920")
-        self.minsize(1150, 650)
         self.fonts = setup_style(self)
+        w, h = min(px(1560), self.winfo_screenwidth() - 40), min(px(920), self.winfo_screenheight() - 80)
+        self.geometry(f"{w}x{h}")
+        self.minsize(min(px(1150), w), min(px(650), h))
+        self._build_menu()
         self.personal = build_cv.load_personal()
         self.file_prefix = build_cv.file_prefix(self.personal)
         self.base_cv = build_cv.load_cv(self.personal)
@@ -417,6 +433,40 @@ class Editor(tk.Tk):
         self._switch_mode("cv")
         self.model.listeners.append(self._model_changed)
         self.protocol("WM_DELETE_WINDOW", self._close)
+
+    # ---- View menu: theme and UI size
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self, tearoff=False)
+        view = tk.Menu(menubar, tearoff=False)
+        menubar.add_cascade(label="View", menu=view)
+        self.view_theme = tk.StringVar(value=appearance.THEME)
+        self.view_scale = tk.DoubleVar(value=appearance.SCALE)
+        for key, label in appearance.THEME_NAMES.items():
+            view.add_radiobutton(label=f"{label} theme", value=key, variable=self.view_theme,
+                                 command=self._apply_view)
+        view.add_separator()
+        for scale in appearance.SCALES:
+            view.add_radiobutton(label=f"UI size {round(scale * 100)} %", value=scale,
+                                 variable=self.view_scale, command=self._apply_view)
+        self.configure(menu=menubar)
+
+    def _apply_view(self) -> None:
+        """Save the theme / UI size and restart the editor, which is when it takes effect."""
+        theme, scale = self.view_theme.get(), self.view_scale.get()
+        appearance.save(theme, scale)
+        unsaved = self._unsaved()
+        question = "The editor restarts to apply the new look."
+        if unsaved:
+            question += ("\n\nUnsaved edits in " + ", ".join(st.label for st in unsaved) + " will be lost.")
+        question += "\n\nRestart now? (No = it applies next time you start the editor.)"
+        if not messagebox.askyesno("Restart editor", question, icon="warning" if unsaved else "question"):
+            return
+        if not self.plan_tab.confirm_close() or not tabs.PostingTextWindow.confirm_close_all():
+            return
+        self.companies_tab._commit()
+        remove_previews()
+        self.destroy()
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     def _close(self) -> None:
         if not self.plan_tab.confirm_close() or not tabs.PostingTextWindow.confirm_close_all():
@@ -615,11 +665,11 @@ class Editor(tk.Tk):
     def _initial_columns(self, event) -> None:
         """Set column widths once, when the window has its real size: left 300px, boxes 540px."""
         panes = event.widget
-        if event.width < 900:
+        if event.width < px(900):
             return
         panes.unbind("<Configure>")
-        panes.sashpos(1, event.width - 540)
-        panes.sashpos(0, 300)
+        panes.sashpos(1, event.width - px(540))
+        panes.sashpos(0, px(300))
 
     @staticmethod
     def _card(parent, **pack) -> ttk.Frame:
@@ -655,7 +705,7 @@ class Editor(tk.Tk):
             b = ttk.Button(row, text=label, style="Segment.TButton", command=lambda c=code: self._switch_language(c))
             b.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
             self.lang_buttons[code] = b
-        self.lang_note = ttk.Label(inner, text="", style="Help.Card.TLabel", wraplength=260, justify="left")
+        self.lang_note = ttk.Label(inner, text="", style="Help.Card.TLabel", wraplength=px(260), justify="left")
         self.lang_note.pack(anchor="w", pady=(8, 0))
         self._update_lang_buttons()
 
@@ -736,7 +786,7 @@ class Editor(tk.Tk):
         # Text preview (email)
         self.text_view = ttk.Frame(self.preview_card, style="Card.TFrame")
         self.text_preview = tk.Text(self.text_view, wrap="word", font=self.fonts["body"], relief="flat",
-                                    borderwidth=0, padx=24, pady=20, background="#FFFFFF",
+                                    borderwidth=0, padx=24, pady=20, background=COLORS["field"],
                                     foreground=COLORS["ink"], highlightthickness=0, state="disabled")
         tscroll = ttk.Scrollbar(self.text_view, orient="vertical", command=self.text_preview.yview)
         self.text_preview.configure(yscrollcommand=tscroll.set)
@@ -943,13 +993,13 @@ class Editor(tk.Tk):
         """A text box with its own scrollbar and a grip along the bottom edge to drag its height.
 
         The mouse wheel scrolls the box while it can scroll that way, then the form (`form_canvas`)."""
-        box = tk.Frame(parent, background="#FFFFFF", highlightthickness=1,
+        box = tk.Frame(parent, background=COLORS["field"], highlightthickness=1,
                        highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
         box.columnconfigure(0, weight=1)
         text = tk.Text(box, height=height, wrap="word", undo=True, font=self.fonts["body"],
-                       padx=8, pady=6, relief="flat", borderwidth=0, background="#FFFFFF",
+                       padx=8, pady=6, relief="flat", borderwidth=0, background=COLORS["field"],
                        foreground=COLORS["ink"], insertbackground=COLORS["ink"],
-                       selectbackground=COLORS["accent"], selectforeground="#FFFFFF", highlightthickness=0)
+                       selectbackground=COLORS["accent"], selectforeground=COLORS["on_accent"], highlightthickness=0)
         scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scroll.set)
         text.grid(row=0, column=0, sticky="nsew")
@@ -989,7 +1039,7 @@ class Editor(tk.Tk):
             pixels = e.y_root - text.winfo_rooty()
             text.configure(height=max(2, round(pixels / line)))
         grip.bind("<B1-Motion>", drag)
-        grip.bind("<Enter>", lambda e: grip.configure(background="#AEB7C4"))
+        grip.bind("<Enter>", lambda e: grip.configure(background=COLORS["scroll_active"]))
         grip.bind("<Leave>", lambda e: grip.configure(background=COLORS["border"]))
         return box, text
 

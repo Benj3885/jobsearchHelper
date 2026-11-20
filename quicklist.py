@@ -19,22 +19,24 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk
 
+import appearance
 import companies
 from tabs import PostingTextWindow, ask_posting, shown
 
 ICONS = [("email", "E"), ("application", "A"), ("cv", "CV")]
-ICON_W, ICON_H, ICON_GAP = 26, 20, 4
+ICON_W, ICON_H, ICON_GAP = appearance.px(26), appearance.px(20), appearance.px(4)
+_C = appearance.COLORS
 ICON_COLORS = {             # state -> (fill, outline, text)
-    "none": ("#F4F6F9", "#DDE2E9", "#BCC4CF"),
-    "saved": ("#E3E7ED", "#AEB7C4", "#4F5A6A"),
-    "ready": ("#2E7D32", "#2E7D32", "#FFFFFF"),
+    "none": _C["icon_none"],
+    "saved": _C["icon_saved"],
+    "ready": (_C["good"], _C["good"], _C["on_accent"]),
 }
 ICON_NAMES = {"email": "Email", "application": "Application", "cv": "CV"}
 STATE_WORDS = {"none": "not saved", "saved": "saved", "ready": "ready"}
 NO_COMPANY = "No company (general)"
 NO_POSTING = "Whole company (no posting)"
 NO_TEXT = "   (no posting text)"
-POSTING_X = len(ICONS) * (ICON_W + ICON_GAP) + 8      # where the P icon starts
+POSTING_X = len(ICONS) * (ICON_W + ICON_GAP) + appearance.px(8)      # where the P icon starts
 
 
 class Quicklist(ttk.Frame):
@@ -233,7 +235,7 @@ class Quicklist(ttk.Frame):
         line("Status", r["Status"] + (f" (last contact {r['Last contact']})" if r["Last contact"] else ""))
         posting = next((p for p in self.model.postings(r) if p["title"] == self.posting), None)
         links = [("Posting", posting["url"] if posting else ""), ("Homepage", r.get("Homepage", "")),
-                 ("Found via", r.get("Found via", ""))]
+                 ("Unsolicited form", r.get("Unsolicited form", "")), ("Found via", r.get("Found via", ""))]
         for label, url in links:
             if url.startswith(("http://", "https://")):
                 t.insert("end", f"{label}: ", ("label",))

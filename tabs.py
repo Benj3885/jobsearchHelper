@@ -18,25 +18,18 @@ import shutil
 import webbrowser
 from collections import Counter
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import font as tkfont, messagebox, simpledialog, ttk
 import tkinter as tk
 
+import appearance
 import companies
 from companies import FITS, STATUSES
 
 DOCS = companies.DOCS
 PLAN = DOCS / "job-search-plan.md"
 
-GOOD = "#2E7D32"           # "posting text saved" (same green as a ready document)
-
-STATUS_COLORS = {
-    "Contacted": "#1F5FA8",
-    "Applied": "#6A3FA0",
-    "Interview": "#B26A00",
-    "Offer": "#2E7D32",
-    "Rejected": "#8A94A3",
-    "Not an option": "#8A94A3",
-}
+GOOD = appearance.COLORS["good"]           # "posting text saved" (same green as a ready document)
+STATUS_COLORS = appearance.COLORS["status"]
 
 # Tk builds without Xft only have X11 core fonts, which cover Latin-1 (æøå are fine) but show
 # characters like • – “ as garbage. Text that is only displayed goes through `shown()`.
@@ -83,16 +76,16 @@ class MarkdownView(tk.Text):
         family = fonts["body"][0]
         super().__init__(parent, wrap="word", relief="flat", borderwidth=0, highlightthickness=0,
                          padx=28, pady=20, background=colors["card"], foreground=colors["ink"],
-                         font=(family, 11), cursor="arrow", spacing1=1, spacing3=1, **kw)
+                         font=(family, appearance.pt(11)), cursor="arrow", spacing1=1, spacing3=1, **kw)
         self.colors = colors
-        self.tag_configure("h1", font=(family, 20, "bold"), spacing1=4, spacing3=10)
-        self.tag_configure("h2", font=(family, 15, "bold"), foreground=colors["accent"], spacing1=18, spacing3=6)
-        self.tag_configure("h3", font=(family, 12, "bold"), spacing1=12, spacing3=4)
-        self.tag_configure("bold", font=(family, 11, "bold"))
+        self.tag_configure("h1", font=(family, appearance.pt(20), "bold"), spacing1=4, spacing3=10)
+        self.tag_configure("h2", font=(family, appearance.pt(15), "bold"), foreground=colors["accent"], spacing1=18, spacing3=6)
+        self.tag_configure("h3", font=(family, appearance.pt(12), "bold"), spacing1=12, spacing3=4)
+        self.tag_configure("bold", font=(family, appearance.pt(11), "bold"))
         self.tag_configure("muted", foreground=colors["muted"])
         self.tag_configure("bullet", lmargin1=14, lmargin2=34)
-        self.tag_configure("quote", lmargin1=18, lmargin2=18, foreground="#3A4656",
-                           background="#F4F6F9", rmargin=20)
+        self.tag_configure("quote", lmargin1=18, lmargin2=18, foreground=colors["quote_ink"],
+                           background=colors["quote_bg"], rmargin=20)
         self.tag_configure("row", lmargin1=14, lmargin2=14, spacing1=8)
         self.tag_configure("cell", lmargin1=30, lmargin2=30)
         self.tag_configure("link", foreground=colors["accent"], underline=True)
@@ -212,9 +205,9 @@ class PlanTab(ttk.Frame):
         self.body = ttk.Frame(self, style="Card.TFrame")
         self.body.pack(fill="both", expand=True)
         self.view = MarkdownView(self.body, colors, fonts)
-        self.editor = tk.Text(self.body, wrap="word", undo=True, autoseparators=True, font=(fonts["body"][0], 12),  # 11 drops "|"
+        self.editor = tk.Text(self.body, wrap="word", undo=True, autoseparators=True, font=(fonts["body"][0], appearance.pt(12)),  # 11 drops "|"
                               relief="flat", borderwidth=0, highlightthickness=0, padx=28, pady=20,
-                              background="#FFFFFF", foreground=colors["ink"], insertbackground=colors["ink"])
+                              background=appearance.COLORS["field"], foreground=colors["ink"], insertbackground=colors["ink"])
         self.editor.bind("<Control-s>", lambda e: (self.save(), "break")[1])
         self.editor.bind("<Escape>", lambda e: self.cancel_edit())
         self.scroll = ttk.Scrollbar(self.body, orient="vertical")
@@ -444,7 +437,7 @@ def ask_posting(parent, model: companies.CompanyList, row: dict[str, str], title
         e.grid(row=i, column=1, sticky="ew", padx=(10, 0), pady=(10, 0))
         entries.append(e)
     ttk.Label(f, text="The title names the folder output/<company>/<title>/. The link is optional.",
-              foreground="#6B7686").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+              foreground=appearance.COLORS["muted"]).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
     result: dict = {}
 
     def ok(_event=None):
@@ -528,11 +521,11 @@ class PostingTextWindow(tk.Toplevel):
         self.status = ttk.Label(bottom, foreground=colors["muted"])
         self.status.pack(side="left", padx=(12, 0))
 
-        box = tk.Frame(self, background="#FFFFFF", highlightthickness=1, highlightbackground=colors["border"],
+        box = tk.Frame(self, background=appearance.COLORS["field"], highlightthickness=1, highlightbackground=colors["border"],
                        highlightcolor=colors["border"])
         box.pack(fill="both", expand=True, padx=16)
         self.text = tk.Text(box, wrap="word", undo=True, font=fonts["body"], padx=12, pady=10, relief="flat",
-                            borderwidth=0, highlightthickness=0, background="#FFFFFF",
+                            borderwidth=0, highlightthickness=0, background=appearance.COLORS["field"],
                             foreground=colors["ink"], insertbackground=colors["ink"])
         scroll = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=scroll.set)
@@ -625,22 +618,28 @@ class CompaniesTab(ttk.Frame):
     on in the Documents tab."""
 
     COLUMNS = [("Company", 190), ("Fit", 55), ("Track", 105), ("Town", 105), ("Status", 100),
-               ("Last contact", 95), ("Quicklist", 75), ("Postings", 70), ("Earlier", 62)]
+               ("Last contact", 95), ("Quicklist", 75), ("Unsolicited", 85), ("Postings", 70),
+               ("Earlier", 62)]
+    COLUMNS = [(col, appearance.px(w)) for col, w in COLUMNS]          # pixel widths follow the UI size
     # These give up width first when the table is narrower than the columns (down to MIN_WIDTHS).
     STRETCH = ("Company", "Track", "Town")
-    MIN_WIDTHS = {"Company": 100, "Track": 55, "Town": 55}
+    MIN_WIDTHS = {c: appearance.px(w) for c, w in {"Company": 100, "Track": 55, "Town": 55}.items()}
     # Number columns: "Postings" = job postings being worked on (Job postings field), "Earlier" = entries
     # in Past postings (companies.count_past_postings). 0 is shown empty; the first click sorts most first.
     COUNT_COLUMNS = ("Postings", "Earlier")
     SORT_KEYS = {
         "Postings": lambda v: int(v or 0),
         "Earlier": lambda v: int(v or 0),
+        "Unsolicited": lambda v: 0 if v else 1,            # companies with a form first
         "Fit": lambda v: {"High": 0, "Medium": 1, "Low": 2}.get(v, 3),
         "Status": lambda v: STATUSES.index(v) if v in STATUSES else len(STATUSES),
     }
     # Single-line fields in the detail panel, in order.
-    FIELDS = ["Fit", "Track", "Town", "What they do", "Contact person", "Email", "Homepage", "Found via"]
-    LINK_FIELDS = ("Homepage", "Found via")     # the full URL is shown below as a clickable link
+    FIELDS = ["Fit", "Track", "Town", "What they do", "Contact person", "Email", "Homepage", "Unsolicited form",
+              "Found via"]
+    # The full URL is shown below as a clickable link. "Unsolicited form" = where to send an unsolicited
+    # application; the table's Unsolicited column shows "form" when it is filled in.
+    LINK_FIELDS = ("Homepage", "Unsolicited form", "Found via")
 
     def __init__(self, parent, colors, fonts, model: companies.CompanyList, on_open=None) -> None:
         super().__init__(parent)
@@ -680,9 +679,9 @@ class CompaniesTab(ttk.Frame):
     def _style(self) -> None:
         s = ttk.Style(self)
         c = self.colors
-        s.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground=c["ink"],
-                    rowheight=26, borderwidth=0, font=self.fonts["body"])
-        s.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", "#FFFFFF")])
+        s.configure("Treeview", background=c["field"], fieldbackground=c["field"], foreground=c["ink"],
+                    rowheight=appearance.px(26), borderwidth=0, font=self.fonts["body"])
+        s.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", c["on_accent"])])
         s.configure("Treeview.Heading", background=c["hover"], foreground=c["ink"], font=self.fonts["bold"],
                     borderwidth=0, relief="flat", padding=(6, 5))
         s.map("Treeview.Heading", background=[("active", c["border"])])
@@ -693,7 +692,7 @@ class CompaniesTab(ttk.Frame):
     def _build_table(self, parent) -> tk.Frame:
         # A fixed size request, so the panes split the space by weight instead of growing with the
         # column widths (which _fit_columns sets from the table's actual width).
-        border = tk.Frame(parent, background=self.colors["border"], width=820, height=300)
+        border = tk.Frame(parent, background=self.colors["border"], width=appearance.px(820), height=appearance.px(300))
         border.pack_propagate(False)
         inner = ttk.Frame(border, style="Card.TFrame")
         inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -701,8 +700,9 @@ class CompaniesTab(ttk.Frame):
                                  selectmode="browse")
         for col, width in self.COLUMNS:
             self.tree.heading(col, text=col, anchor="w", command=lambda c=col: self._sort(c))
-            self.tree.column(col, width=width, minwidth=self.MIN_WIDTHS.get(col, 50),
-                             anchor="center" if col in self.COUNT_COLUMNS else "w", stretch=col in self.STRETCH)
+            self.tree.column(col, width=width, minwidth=self.MIN_WIDTHS.get(col, appearance.px(50)),
+                             anchor="center" if col in self.COUNT_COLUMNS + ("Quicklist", "Unsolicited") else "w",
+                             stretch=col in self.STRETCH)
         for status, color in STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
         self.tree.tag_configure("interesting", font=self.fonts["bold"])
@@ -731,7 +731,16 @@ class CompaniesTab(ttk.Frame):
     # ---- right: details of the selected company
     def _build_details(self, parent) -> tk.Frame:
         border = tk.Frame(parent, background=self.colors["border"])
-        d = ttk.Frame(border, style="Card.TFrame", padding=(16, 14))      # packed below, after the buttons
+        # The fields scroll when they don't fit (big UI size, small window). The panel is stretched to
+        # the visible height when there is room, so the text tabs at the bottom take what is left.
+        self.d_canvas = tk.Canvas(border, highlightthickness=0, borderwidth=0, background=self.colors["card"])
+        d_scroll = ttk.Scrollbar(border, orient="vertical", command=self.d_canvas.yview)
+        self.d_canvas.configure(yscrollcommand=d_scroll.set)
+        d = ttk.Frame(self.d_canvas, style="Card.TFrame", padding=(16, 14))
+        self.d_window = self.d_canvas.create_window(0, 0, window=d, anchor="nw")
+        self.d_canvas.bind("<Configure>", lambda e: self._fit_details())
+        d.bind("<Configure>", lambda e: self._fit_details())
+        self.d_panel = d
         d.columnconfigure(1, weight=1)
         head = ttk.Frame(d, style="Card.TFrame")
         head.grid(row=0, column=0, columnspan=3, sticky="ew")
@@ -776,7 +785,11 @@ class CompaniesTab(ttk.Frame):
                                        width=16)
         self.status_box.pack(side="left")
         self.status_box.bind("<<ComboboxSelected>>", lambda e: self._status_changed())
-        ttk.Label(status_row, text="Last contact", style="Field.Card.TLabel").pack(side="left", padx=(18, 8))
+        row += 1
+        # Own row, so it isn't cut off when the panel is narrow (big UI size).
+        ttk.Label(d, text="Last contact", style="Field.Card.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        status_row = ttk.Frame(d, style="Card.TFrame")
+        status_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(6, 0), padx=(12, 0))
         self.d_date = ttk.Entry(status_row, width=12)
         self.d_date.pack(side="left")
         self.d_date.bind("<FocusOut>", lambda e: self._commit())
@@ -796,15 +809,15 @@ class CompaniesTab(ttk.Frame):
         self.text_tabs.add(page, text="Job postings")
         pbar = ttk.Frame(page, style="Card.TFrame")
         pbar.pack(fill="x")
-        ttk.Label(pbar, text="Double-click a posting to read or paste the ad's text.", style="Help.Card.TLabel"
-                  ).pack(side="left")
         self.posting_btns = {}
-        for key, text, command in (("text", "Posting text", self._posting_text),
-                                   ("remove", "Remove", self._remove_posting), ("edit", "Edit...", self._edit_posting),
-                                   ("add", "Add...", self._add_posting)):
+        for key, text, command in (("add", "Add...", self._add_posting), ("edit", "Edit...", self._edit_posting),
+                                   ("remove", "Remove", self._remove_posting),
+                                   ("text", "Posting text", self._posting_text)):
             b = ttk.Button(pbar, text=text, padding=(8, 2), command=command)
-            b.pack(side="right", padx=(4, 0))
+            b.pack(side="left", padx=(0, 4))
             self.posting_btns[key] = b
+        ttk.Label(page, text="Double-click a posting to read or paste the ad's text.", style="Help.Card.TLabel"
+                  ).pack(anchor="w", pady=(4, 0))
         # The table cuts long URLs off, so the selected posting's full link is shown below it too.
         self.p_link = LinkLabel(page, self.colors, self.fonts)
         self.p_link.pack(side="bottom", fill="x", pady=(4, 0))
@@ -815,7 +828,7 @@ class CompaniesTab(ttk.Frame):
         for col, text, width, stretch in (("title", "Posting", 220, True), ("text", "Posting text", 110, False),
                                           ("link", "Link", 320, True)):
             self.p_tree.heading(col, text=text, anchor="w")
-            self.p_tree.column(col, width=width, minwidth=40, anchor="w", stretch=stretch)
+            self.p_tree.column(col, width=appearance.px(width), minwidth=appearance.px(40), anchor="w", stretch=stretch)
         self.p_tree.tag_configure("saved", foreground=GOOD)
         self.p_tree.tag_configure("missing", foreground=self.colors["muted"])
         self.p_tree.pack(fill="both", expand=True, padx=1, pady=1)
@@ -840,9 +853,46 @@ class CompaniesTab(ttk.Frame):
         self.delete_btn.pack(side="left", padx=(6, 0))
         self.saved = ttk.Label(bottom, style="Status.Card.TLabel")
         self.saved.pack(side="right")
-        d.pack(fill="both", expand=True, padx=1, pady=(1, 0))
+        d_scroll.pack(side="right", fill="y", pady=(1, 0))
+        self.d_canvas.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=(1, 0))
+        self._bind_details_wheel()
         self._show_details(None)
         return border
+
+    def _fit_details(self) -> None:
+        """Panel as wide as the canvas, and as tall as the canvas or its content, whichever is taller."""
+        c, d = self.d_canvas, self.d_panel
+        width, height = c.winfo_width(), max(c.winfo_height(), d.winfo_reqheight())
+        if (int(c.itemcget(self.d_window, "width") or 0), int(c.itemcget(self.d_window, "height") or 0)) \
+                != (width, height):
+            c.itemconfigure(self.d_window, width=width, height=height)
+        c.configure(scrollregion=(0, 0, width, height))
+
+    def _bind_details_wheel(self) -> None:
+        """Mouse wheel over the detail panel scrolls it. Text boxes and the postings table scroll
+        themselves; dropdowns scroll the panel instead of changing their value."""
+        def wheel(e):
+            if not str(e.widget).startswith(str(self.d_canvas)) or e.widget.winfo_class() in ("Text", "Treeview"):
+                return None
+            if self.d_canvas.yview() != (0.0, 1.0):
+                self.d_canvas.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+            return "break"
+
+        def enter(_e):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.d_canvas.bind_all(seq, wheel)
+
+        def leave(e):
+            # <Leave> also fires when the pointer moves onto a child; only unbind when it left the panel.
+            x, y = e.x_root - self.d_canvas.winfo_rootx(), e.y_root - self.d_canvas.winfo_rooty()
+            if not (0 <= x < self.d_canvas.winfo_width() and 0 <= y < self.d_canvas.winfo_height()):
+                for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    self.d_canvas.unbind_all(seq)
+        self.d_canvas.bind("<Enter>", enter)
+        self.d_canvas.bind("<Leave>", leave)
+        for box in (self.entries["Fit"], self.status_box):         # don't change Fit/Status by scrolling
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                box.bind(seq, wheel)
 
     # ---- data
     def refresh(self, force: bool = False) -> None:
@@ -876,6 +926,8 @@ class CompaniesTab(ttk.Frame):
         for c, _ in self.COLUMNS:
             if c == "Quicklist":
                 values.append("[x]" if companies.is_interesting(r) else "[  ]")
+            elif c == "Unsolicited":
+                values.append("form" if companies.has_unsolicited_form(r) else "")
             elif c == "Postings":
                 values.append(str(len(self.model.postings(r)) or ""))
             elif c == "Earlier":
@@ -942,7 +994,8 @@ class CompaniesTab(ttk.Frame):
             return
         index, col = cell
         if col == "Quicklist":
-            self.after_idle(self._toggle_quicklist, index)
+            if self._on_checkbox(index, e.x):
+                self.after_idle(self._toggle_quicklist, index)
         elif col in ("Status", "Fit"):
             self.after_idle(self._cell_menu, index, col, e.x_root, e.y_root)
 
@@ -956,6 +1009,17 @@ class CompaniesTab(ttk.Frame):
         elif col in self.TEXT_CELLS:
             self.after_idle(self._cell_entry, index, col)
         return "break"
+
+    def _on_checkbox(self, index: int, x: int) -> bool:
+        """True if x (in the table) is on the [x] drawn in the centre of the row's Quicklist cell,
+        so a click elsewhere in the wide cell doesn't tick it."""
+        box = self.tree.bbox(str(index), "Quicklist")
+        if not box:
+            return False
+        cell_x, _, cell_w, _ = box
+        text = self.tree.set(str(index), "Quicklist")
+        half = tkfont.Font(font=self.fonts["body"]).measure(text) / 2 + 4     # a little slack around it
+        return abs(x - (cell_x + cell_w / 2)) <= half
 
     def _toggle_quicklist(self, index: int) -> None:
         r = self.rows[index]
@@ -1089,11 +1153,11 @@ class CompaniesTab(ttk.Frame):
         tabs.add(page, text=label)
         if help_text:
             ttk.Label(page, text=help_text, style="Help.Card.TLabel").pack(anchor="w", pady=(0, 4))
-        box = tk.Frame(page, background="#FFFFFF", highlightthickness=1,
+        box = tk.Frame(page, background=appearance.COLORS["field"], highlightthickness=1,
                        highlightbackground=self.colors["border"], highlightcolor=self.colors["border"])
         box.pack(fill="both", expand=True)
         text = tk.Text(box, wrap="word", undo=True, font=self.fonts["body"], height=4, padx=8, pady=6,
-                       relief="flat", borderwidth=0, highlightthickness=0, background="#FFFFFF",
+                       relief="flat", borderwidth=0, highlightthickness=0, background=appearance.COLORS["field"],
                        foreground=self.colors["ink"], insertbackground=self.colors["ink"])
         scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scroll.set)
